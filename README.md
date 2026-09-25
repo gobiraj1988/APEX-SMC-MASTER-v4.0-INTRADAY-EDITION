@@ -44,3 +44,8 @@ After adding: indicator ⋯ → Pin to scale → Pin to right scale.
 
 # APEX Quant v6 — `APEX_Quant_v6.pine`
 Regime-adaptive (Trend / Range / Stand-aside) intraday + swing indicator. See `APEX_Quant_v6_GUIDE.md`.
+
+---
+
+# APEX Quant v7 — `APEX_Quant_v7.pine`
+Multi-timeframe mirror (15m / 1H / 4H signals with their own SL/TP on lower charts), sniper entries, MAE/MFE-based TP calibration. See `APEX_Quant_v7_GUIDE.md`.

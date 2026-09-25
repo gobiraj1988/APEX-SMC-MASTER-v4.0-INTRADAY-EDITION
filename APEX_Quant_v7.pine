@@ -1,0 +1,747 @@
+//@version=6
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  APEX QUANT v7 — Multi-Timeframe Mirror + MAE/MFE Calibration     ║
+// ║  • ONE signal engine (f_engine) for every timeframe: the 15m BUY  ║
+// ║    you see on a 1m chart is computed by the same code, on the     ║
+// ║    same 15m bars, as the BUY on the 15m chart itself.             ║
+// ║  • Mirror up to 3 higher timeframes onto the chart: "15m BUY",    ║
+// ║    "1H SELL" tags + that timeframe's own SL / TP lines, tracked   ║
+// ║    candle-by-candle on the chart timeframe.                       ║
+// ║  • Optional sniper entry: wait for a pullback into the HTF signal ║
+// ║    candle, then a confirmation close (better entry, same SL).     ║
+// ║  • ALIGNED / A+ badge; optional "aligned-only" filter.            ║
+// ║  • MAE / MFE stats + "Suggested TP" from your own trade history.  ║
+// ║  Non-repainting. Research tool: no indicator is guaranteed        ║
+// ║  accurate — judge it by the stats, out-of-sample, after costs.    ║
+// ╠══════════════════════════════════════════════════════════════════╣
+// ║  COPY THE WHOLE FILE. Last line: // ═══ END OF APEX QUANT v7 ═══   ║
+// ╚══════════════════════════════════════════════════════════════════╝
+indicator("APEX Quant v7", "APEX Q7", overlay = true, scale = scale.right,
+     max_lines_count = 500, max_labels_count = 500)
+
+// ───────────────────────────── INPUTS ─────────────────────────────
+grpM    = "⚡ Engine"
+modeIn  = input.string("Auto", "Mode", options = ["Auto", "Intraday", "Swing / Invest"], group = grpM,
+     tooltip = "Auto decides per timeframe: 1m–1h = Intraday, 4H / D / W = Swing (long-only by default).")
+freqIn  = input.string("Normal", "Signal frequency", options = ["Active", "Normal", "Conservative"], group = grpM)
+dirIn   = input.string("Auto", "Direction", options = ["Auto", "Both", "Long only"], group = grpM)
+tzIn    = input.string("GMT+4", "Your timezone", group = grpM)
+useTrendSetup = input.bool(true, "Trend pullback setup", group = grpM)              // continuation edge
+useRangeSetup = input.bool(true, "Range fade setup (intraday)", group = grpM)      // intraday frequency source
+useSwingBO    = input.bool(true, "Swing breakout setup (swing)", group = grpM)     // 20-bar breakout + volume
+chaseATR      = input.float(1.2, "Anti-chase: max distance from EMA-21 (× ATR)", minval = 0.3, step = 0.1, group = grpM) // late entries = worse R:R
+nearHighPct   = input.float(25.0, "Swing: within X% of 52-bar high", minval = 1, maxval = 100, group = grpM)           // leadership filter
+swingVolMult  = input.float(1.5, "Swing breakout volume (× 20-bar avg)", minval = 0.5, step = 0.1, group = grpM)      // real breakouts carry volume
+
+grpR     = "🛡 Risk & exits"
+tpIntra  = input.float(1.3, "TP (R) — intraday trend", minval = 0.5, maxval = 10, step = 0.1, group = grpR)   // high hit-rate, above costs
+tpSwing  = input.float(2.5, "TP (R) — swing", minval = 0.5, maxval = 10, step = 0.1, group = grpR)            // swings travel further
+minRangeRR = input.float(0.8, "Range fade: min R to mid-band", minval = 0.3, step = 0.1, group = grpR)        // skip tiny-reward fades
+maxRangeRR = input.float(2.0, "Range fade: cap R", minval = 0.5, step = 0.1, group = grpR)
+floorATR   = input.float(1.2, "SL floor (× ATR)", minval = 0.3, step = 0.1, group = grpR)                  // stop outside bar noise
+noiseMult  = input.float(0.5, "SL floor (× avg 8-bar range)", minval = 0, step = 0.05, group = grpR)       // stop outside multi-bar swings (fixes tight 1m SL)
+bufATR     = input.float(0.3, "SL buffer beyond swing (× ATR)", minval = 0, step = 0.05, group = grpR)     // stop-hunt wick buffer
+maxRiskATR = input.float(3.0, "Skip if SL wider than (× ATR)", minval = 1, step = 0.1, group = grpR)      // bad location → skip, never shrink
+spreadTk   = input.int(30, "Spread / cost (ticks), intraday", minval = 0, group = grpR)                    // XAUUSD: 30 ticks = 0.30
+spreadTkSw = input.int(2, "Spread / cost (ticks), swing", minval = 0, group = grpR)
+usePartial = input.bool(false, "Partial: 50% at 1R + SL to break-even", group = grpR)                     // optional; lowers variance, not expectancy
+iMaxHold   = input.int(0, "Time-stop (bars of the signal TF, 0 = auto)", minval = 0, group = grpR,
+     tooltip = "Auto: 1m=90, 5m=48, 15m=32, 1h=24, swing=60 bars.")
+
+grpS     = "🕒 Session & limits"
+sessMode = input.string("Auto", "Session filter", options = ["Auto", "On", "Off"], group = grpS,
+     tooltip = "Auto = ON for 1m–5m signal timeframes only.")
+sessIn   = input.session("1100-0100", "Session (your timezone)", group = grpS)   // London open → NY close
+maxDay   = input.int(10, "Max trades per day per timeframe (intraday)", minval = 1, maxval = 50, group = grpS)
+
+grpX     = "🔭 Multi-timeframe mirror"
+useTF1   = input.bool(true,  "Mirror TF 1", inline = "t1", group = grpX)
+tf1      = input.timeframe("15",  "", inline = "t1", group = grpX)
+useTF2   = input.bool(true,  "Mirror TF 2", inline = "t2", group = grpX)
+tf2      = input.timeframe("60",  "", inline = "t2", group = grpX)
+useTF3   = input.bool(false, "Mirror TF 3", inline = "t3", group = grpX)
+tf3      = input.timeframe("240", "", inline = "t3", group = grpX,
+     tooltip = "Only timeframes ABOVE the chart timeframe are used. Note: 4H uses Swing logic in Auto mode (long-only).")
+alignMode  = input.string("Auto", "Only take chart-TF signals aligned with HTF", options = ["Auto", "On", "Off"], group = grpX,
+     tooltip = "Auto = ON on 1m / 5m charts. Aligned = at least one mirrored TF biased the same way and none opposite.")
+useSniper  = input.bool(true, "Sniper entry for mirrored signals", group = grpX,
+     tooltip = "Wait for price to pull back to 50% of the HTF signal candle (or entry ∓ 0.25 ATR), then a confirmation close.")
+sniperBars = input.int(30, "Sniper: max chart bars to wait", minval = 2, maxval = 500, group = grpX)
+
+grpAL    = "🔔 Alerts (sound + pop-up)"
+alChart  = input.bool(true, "Chart-TF entries", group = grpAL,
+     tooltip = "Create ONE alert: Condition = APEX Q7 → 'Any alert() function call', tick Show pop-up + Play sound.")
+alTF1    = input.bool(true, "Mirror TF 1 entries", group = grpAL)
+alTF2    = input.bool(true, "Mirror TF 2 entries", group = grpAL)
+alTF3    = input.bool(true, "Mirror TF 3 entries", group = grpAL)
+alExits  = input.bool(true, "Exits (TP / SL / BE / time / missed)", group = grpAL)
+
+grpUI     = "Display"
+keepN     = input.int(15, "Keep last N signals per source", minval = 1, maxval = 50, group = grpUI)
+anaSrc    = input.string("Chart TF", "MAE / MFE analysis source", options = ["Chart TF", "Mirror TF 1", "Mirror TF 2", "Mirror TF 3"], group = grpUI)
+showTrade = input.bool(true, "Show trade table", group = grpUI)
+showStats = input.bool(true, "Show stats tables", group = grpUI)
+
+// ─────────────────────── FREQUENCY PRESETS ───────────────────────
+isAct       = freqIn == "Active"
+isCons      = freqIn == "Conservative"
+adxTrend    = isAct ? 18.0 : isCons ? 23.0 : 20.0   // ADX needed for TREND
+chopTrendMx = isAct ? 58.0 : isCons ? 50.0 : 55.0   // CHOP below = trending
+chopRangeMn = isAct ? 42.0 : isCons ? 50.0 : 45.0   // CHOP above = ranging
+rsiLo       = isAct ? 15.0 : isCons ? 5.0  : 10.0   // RSI(2) exhaustion for range fades
+rsiHi       = 100.0 - rsiLo
+cdBars      = isAct ? 2 : isCons ? 5 : 3            // cooldown after an exit
+cdLossBars  = cdBars * 2                            // longer after a stop-out
+dupBars     = isAct ? 6 : isCons ? 12 : 8           // duplicate suppression window
+
+colSL = color.new(color.red, 0)
+colTP = color.new(color.blue, 0)
+
+// ─────────────────────── HELPERS (global scope) ───────────────────────
+f_holdMs(int tfS) =>
+    bars = iMaxHold > 0 ? iMaxHold : tfS > 3600 ? 60 : tfS <= 60 ? 90 : tfS <= 300 ? 48 : tfS <= 900 ? 32 : 24
+    bars * tfS * 1000
+
+f_tfName(string tf) =>
+    s = timeframe.in_seconds(tf)
+    s < 3600 ? str.tostring(math.round(s / 60)) + "m" : s < 86400 ? str.tostring(math.round(s / 3600)) + "H" :
+     s < 604800 ? "D" : s < 2419200 ? "W" : "M"
+
+fmt(float v) =>
+    na(v) ? "—" : str.tostring(v, format.mintick)
+
+pctTxt(int c, int total) =>
+    total > 0 ? str.tostring(100.0 * c / total, "#") + "%" : "—"
+
+// ═══════════════════════ SIGNAL ENGINE ═══════════════════════
+// Evaluated on whatever timeframe it runs on (chart TF directly, HTFs via
+// request.security). No drawings, no alerts. Its internal position gating
+// (one trade at a time, cooldowns, duplicate suppression, daily cap) uses only
+// that timeframe's own bars, so every chart shows the identical signal list.
+// Returns [dir, entry, sl, tp, rr, setup, sigHigh, sigLow, bias, regime].
+// allowDir: 0 = both, 1 = long only, -1 = short only, 9 = none (alignment filter).
+f_engine(int allowDir) =>
+    tfS    = timeframe.in_seconds(timeframe.period)
+    intra  = modeIn == "Intraday" or (modeIn == "Auto" and tfS <= 3600)
+    lOnly  = dirIn == "Long only" or (dirIn == "Auto" and not intra)
+    tpT    = intra ? tpIntra : tpSwing
+    sprd   = (intra ? spreadTk : spreadTkSw) * syminfo.mintick
+    sessOn = sessMode == "On" or (sessMode == "Auto" and intra and tfS <= 300)
+    holdMs = f_holdMs(tfS)
+    // every ta.* call once per bar, before any branch
+    e21  = ta.ema(close, 21)
+    e50  = ta.ema(close, 50)
+    e55  = ta.ema(close, 55)
+    e200 = ta.ema(close, 200)
+    a14  = ta.atr(14)
+    r2   = ta.rsi(close, 2)
+    r2lo = ta.lowest(r2, 3)
+    r2hi = ta.highest(r2, 3)
+    [dp, dm, adx] = ta.dmi(14, 14)
+    adxSl = adx - adx[3]
+    trS  = math.sum(ta.tr(true), 14)
+    rg14 = ta.highest(high, 14) - ta.lowest(low, 14)
+    chp  = rg14 > 0 ? 100.0 * math.log10(trS / rg14) / math.log10(14) : 50.0
+    aPct = ta.percentrank(a14, 100)
+    [bm, bu, bl] = ta.bb(close, 20, 2.0)
+    vw   = ta.vwap(hlc3)
+    vAvg = ta.sma(volume, 20)
+    h20  = ta.highest(high, 20)
+    l20  = ta.lowest(low, 20)
+    h52  = ta.highest(high, 52)
+    lPB  = ta.lowest(low, 5)
+    hPB  = ta.highest(high, 5)
+    l3   = ta.lowest(low, 3)
+    h3   = ta.highest(high, 3)
+    noise = ta.sma(ta.highest(high, 8) - ta.lowest(low, 8), 20)
+    inS  = not na(time(timeframe.period, sessIn, tzIn))
+    dk   = dayofmonth(time, tzIn)
+
+    // regime: 1 trend, 2 range, 0 stand aside
+    isTr = adx >= adxTrend and (adxSl >= 0 or adx >= 30) and chp < chopTrendMx and aPct < 97
+    isRg = adx < adxTrend and chp >= chopRangeMn and aPct <= 85
+    reg  = isTr ? 1 : isRg ? 2 : 0
+    // directional bias (EMA-200 stands in for the next timeframe's EMA-50)
+    upB = e21 > e55 and close > e55 and close > e200 and dp > dm
+    dnB = e21 < e55 and close < e55 and close < e200 and dm > dp
+    if intra and not na(vw)
+        upB := upB and close > vw
+        dnB := dnB and close < vw
+    if not intra
+        upB := upB and close > e50 and e50 > e200 and close >= h52 * (1.0 - nearHighPct / 100.0)
+        dnB := dnB and close < e50 and e50 < e200
+
+    // setups
+    impR  = h20 - l20
+    retL  = impR > 0 ? (h20 - lPB) / impR : 0.0
+    retS  = impR > 0 ? (hPB - l20) / impR : 0.0
+    pbL   = lPB <= e21 + 0.25 * a14 or (retL >= 0.382 and retL <= 0.618)
+    pbS   = hPB >= e21 - 0.25 * a14 or (retS >= 0.382 and retS <= 0.618)
+    cfL   = close > open and close > high[1] and close - open >= 0.3 * a14 and close > e21
+    cfS   = close < open and close < low[1]  and open - close >= 0.3 * a14 and close < e21
+    chL   = close - e21 <= chaseATR * a14
+    chS   = e21 - close <= chaseATR * a14
+    hasV  = not na(vAvg) and vAvg > 0
+    vPB   = not hasV or volume >= vAvg
+    vBO   = not hasV or volume >= swingVolMult * vAvg
+    bRng  = high - low
+    wkL   = bRng > 0 and math.min(open, close) - low >= 0.4 * bRng
+    wkS   = bRng > 0 and high - math.max(open, close) >= 0.4 * bRng
+    trL   = useTrendSetup and reg == 1 and upB and pbL and cfL and chL and (intra or vPB)
+    trSh  = useTrendSetup and reg == 1 and dnB and pbS and cfS and chS and (intra or vPB)
+    rgL   = useRangeSetup and intra and reg == 2 and low <= bl and close > bl and wkL and r2lo < rsiLo and close < bm
+    rgS   = useRangeSetup and intra and reg == 2 and high >= bu and close < bu and wkS and r2hi > rsiHi and close > bm
+    boL   = useSwingBO and not intra and upB and close > h20[1] and close > open and vBO and chL
+
+    // stop / target
+    buf   = math.max(bufATR * a14, sprd)
+    flr   = math.max(floorATR * a14, noiseMult * nz(noise, 0.0))
+    mxR   = math.max(maxRiskATR * a14, 1.5 * flr)
+    stL   = trL ? 1 : boL ? 3 : rgL ? 2 : 0
+    slL   = math.min((stL == 2 ? l3 : lPB) - buf, close - flr)
+    rkL   = close - slL
+    mdL   = rkL > 0 ? (bm - close) / rkL : 0.0
+    rrL   = stL == 2 ? math.min(mdL, maxRangeRR) : tpT
+    okL   = stL > 0 and rkL > 0 and rkL <= mxR and (stL != 2 or mdL >= minRangeRR)
+    stS   = lOnly ? 0 : trSh ? 1 : rgS ? 2 : 0
+    slS   = math.max((stS == 2 ? h3 : hPB) + buf, close + flr)
+    rkS   = slS - close
+    mdS   = rkS > 0 ? (close - bm) / rkS : 0.0
+    rrS   = stS == 2 ? math.min(mdS, maxRangeRR) : tpT
+    okS   = stS > 0 and rkS > 0 and rkS <= mxR and (stS != 2 or mdS >= minRangeRR)
+
+    // internal position gating (same exits as the chart tracker)
+    var int   pDir  = 0
+    var float pEnt  = na
+    var float pSL   = na
+    var float pTP   = na
+    var float pRk   = na
+    var float pRR   = na
+    var int   pBar  = na
+    var int   pTime = na
+    var bool  pBE   = false
+    var int   exBar = na
+    var bool  exSL  = false
+    var int   lLB   = na
+    var float lLP   = na
+    var int   lSB   = na
+    var float lSP   = na
+    var int   cnt   = 0
+    if dk != dk[1]
+        cnt := 0
+    if pDir != 0 and bar_index > pBar
+        hSL = pDir == 1 ? low <= pSL : high >= pSL
+        hTP = pDir == 1 ? high >= pTP : low <= pTP
+        if hSL or hTP or time - pTime >= holdMs
+            exBar := bar_index
+            exSL  := hSL and not pBE
+            pDir  := 0
+        else if usePartial and pRR > 1.0 and not pBE
+            if (pDir == 1 and high >= pEnt + pRk) or (pDir == -1 and low <= pEnt - pRk)
+                pBE := true
+                pSL := pEnt
+
+    cool = na(exBar) or bar_index - exBar >= (exSL ? cdLossBars : cdBars)
+    dupL = not na(lLB) and (bar_index - lLB < dupBars or (math.abs(close - lLP) < a14 and bar_index - lLB < 4 * dupBars))
+    dupS = not na(lSB) and (bar_index - lSB < dupBars or (math.abs(close - lSP) < a14 and bar_index - lSB < 4 * dupBars))
+    base = pDir == 0 and cool and (not sessOn or inS) and (not intra or cnt < maxDay) and not na(a14) and not na(adx)
+    gL   = base and okL and not dupL and (allowDir == 0 or allowDir == 1)
+    gS   = base and okS and not dupS and not gL and (allowDir == 0 or allowDir == -1)
+    sig  = gL ? 1 : gS ? -1 : 0
+    stp  = gL ? stL : gS ? stS : 0
+    if sig != 0
+        pDir  := sig
+        pEnt  := close
+        pSL   := gL ? slL : slS
+        pRk   := gL ? rkL : rkS
+        pRR   := gL ? rrL : rrS
+        pTP   := close + sig * pRR * pRk
+        pBar  := bar_index
+        pTime := time
+        pBE   := false
+        cnt   += 1
+        if sig == 1
+            lLB := bar_index
+            lLP := close
+        else
+            lSB := bar_index
+            lSP := close
+    bias = pDir != 0 ? pDir : upB ? 1 : dnB ? -1 : 0
+    [sig, sig != 0 ? pEnt : na, sig != 0 ? pSL : na, sig != 0 ? pTP : na, sig != 0 ? pRR : na,
+     stp, high, low, bias, reg]
+
+// HTF wrapper: values of the last CONFIRMED HTF bar ([1] + lookahead_on).
+// A 15m signal therefore appears on the first 1m bar AFTER the 15m candle closes
+// (09:45–10:00 candle → tag on the 10:00 1m bar). Earlier would require repainting.
+f_engineHTF() =>
+    [s, e, sl, tp, rr, st, hi, lo, bi, rg] = f_engine(0)
+    [s[1], e[1], sl[1], tp[1], rr[1], st[1], hi[1], lo[1], bi[1], rg[1]]
+
+// ═══════════════════════ TRADE TRACKER (chart-TF candles) ═══════════════════════
+type Trade
+    int    dir     = 0
+    float  entry   = na
+    float  sl      = na
+    float  tp      = na
+    float  risk    = na
+    float  rr      = na
+    int    t0      = na
+    int    bar     = na
+    int    holdMs  = 0
+    bool   be      = false
+    float  mfe     = 0.0
+    float  mae     = 0.0
+    float  sprPx   = 0.0
+    float  costR   = 0.0
+    bool   pending = false
+    float  pendLvl = na
+    bool   touched = false
+    string name    = ""
+    string setup   = ""
+    string sigTime = "—"
+    string status  = "—"
+    line   lnSl
+    line   lnTp
+    label  tag
+
+type Stat
+    int   n       = 0
+    int   wins    = 0
+    int   losses  = 0
+    int   cSL     = 0
+    int   cTP     = 0
+    int   cBE     = 0
+    int   cTime   = 0
+    int   missed  = 0
+    int   consec  = 0
+    int   maxCons = 0
+    float net     = 0.0
+    float gW      = 0.0
+    float gL      = 0.0
+    float sumRR   = 0.0
+    float peak    = 0.0
+    float maxDD   = 0.0
+    int   r05     = 0
+    int   r10     = 0
+    int   r15     = 0
+    int   r20     = 0
+    array<float> mfeA
+    array<float> exA
+    array<float> costA
+    array<float> maeW
+
+f_newStat() =>
+    Stat.new(mfeA = array.new<float>(), exA = array.new<float>(), costA = array.new<float>(), maeW = array.new<float>())
+
+f_setupName(int st) =>
+    st == 1 ? "Trend pullback" : st == 2 ? "Range fade" : st == 3 ? "Breakout" : "—"
+
+// Record a finished trade. r = realised R (with partial), rFull = full-position R (for MFE analysis).
+f_close(Trade t, Stat s, float r, float rFull, string typ, bool alrt) =>
+    net = r - t.costR
+    line.set_x2(t.lnSl, bar_index)
+    line.set_x2(t.lnTp, bar_index)
+    s.n := s.n + 1
+    s.net := s.net + (net)
+    s.sumRR := s.sumRR + (t.rr)
+    if net > 0
+        s.wins := s.wins + 1
+        s.gW := s.gW + (net)
+        s.consec := 0
+    else
+        s.losses := s.losses + 1
+        s.gL := s.gL - (net)
+        s.consec := s.consec + 1
+        s.maxCons := math.max(s.maxCons, s.consec)
+    s.cSL := s.cSL + (typ == "SL"   ? 1 : 0)
+    s.cTP := s.cTP + (typ == "TP"   ? 1 : 0)
+    s.cBE := s.cBE + (typ == "BE"   ? 1 : 0)
+    s.cTime := s.cTime + (typ == "TIME" ? 1 : 0)
+    s.r05 := s.r05 + (t.mfe >= 0.5 ? 1 : 0)
+    s.r10 := s.r10 + (t.mfe >= 1.0 ? 1 : 0)
+    s.r15 := s.r15 + (t.mfe >= 1.5 ? 1 : 0)
+    s.r20 := s.r20 + (t.mfe >= 2.0 ? 1 : 0)
+    s.peak  := math.max(s.peak, s.net)
+    s.maxDD := math.max(s.maxDD, s.peak - s.net)
+    array.push(s.mfeA, t.mfe)
+    array.push(s.exA, rFull)
+    array.push(s.costA, t.costR)
+    if rFull > 0
+        array.push(s.maeW, t.mae)
+    t.status := typ == "TP" ? "TP HIT ✓" : typ == "SL" ? "SL HIT ✗" : typ == "BE" ? "BE (50% banked)" :
+         "TIME EXIT (" + str.tostring(r, "#.##") + "R)"
+    if alrt
+        alert("APEX Q7 " + t.name + " " + (t.dir == 1 ? "BUY" : "SELL") + " " + syminfo.ticker + " closed: " + t.status,
+             alert.freq_all)
+    t.dir := 0
+    true
+
+// Open a trade (or a pending sniper order) and draw its tag + SL/TP lines.
+f_open(Trade t, int dir, float en, float sl, float tp, int holdMs, float sprPx, bool pend, float pendLvl,
+     string nm, string setupNm, string tagTxt, color col, int slot, float atrC, array<line> lns, array<label> lbs) =>
+    t.dir     := dir
+    t.entry   := en
+    t.sl      := sl
+    t.tp      := tp
+    t.risk    := math.abs(en - sl)
+    t.rr      := math.abs(tp - en) / math.abs(en - sl)
+    t.t0      := time
+    t.bar     := bar_index
+    t.holdMs  := holdMs
+    t.be      := false
+    t.mfe     := 0.0
+    t.mae     := 0.0
+    t.sprPx   := sprPx
+    t.costR   := sprPx / math.abs(en - sl)
+    t.pending := pend
+    t.pendLvl := pendLvl
+    t.touched := false
+    t.name    := nm
+    t.setup   := setupNm
+    t.sigTime := str.format_time(time, "dd MMM HH:mm", tzIn)
+    t.status  := pend ? "WAIT PULLBACK ≤ " + fmt(pendLvl) : "RUNNING"
+    lnStyle = slot == 0 ? line.style_solid : line.style_dashed
+    t.lnSl := line.new(bar_index, sl, bar_index, sl, color = colSL, width = 2, style = lnStyle)
+    t.lnTp := line.new(bar_index, tp, bar_index, tp, color = colTP, width = 2, style = lnStyle)
+    array.push(lns, t.lnSl)
+    array.push(lns, t.lnTp)
+    tip = nm + " " + (dir == 1 ? "BUY" : "SELL") + " · " + setupNm + " · " + t.sigTime +
+         "\nEntry: " + fmt(en) + (pend ? " (sniper ≤ " + fmt(pendLvl) + ")" : "") +
+         "\nSL: " + fmt(sl) + "\nTP: " + fmt(tp) + " (" + str.tostring(t.rr, "#.##") + "R)"
+    off = (0.6 + 1.3 * slot) * atrC      // separate slots → tags never overlap
+    t.tag := dir == 1 ?
+         label.new(bar_index, low - off, tagTxt, style = label.style_label_up, color = col,
+             textcolor = color.white, size = size.small, tooltip = tip) :
+         label.new(bar_index, high + off, tagTxt, style = label.style_label_down, color = col,
+             textcolor = color.white, size = size.small, tooltip = tip)
+    array.push(lbs, t.tag)
+    true
+
+// Advance a trade by one CONFIRMED chart candle. Same-candle SL + TP → SL (conservative).
+f_update(Trade t, Stat s, bool alrt, array<line> lns, array<label> lbs) =>
+    isL = t.dir == 1
+    if t.dir != 0 and bar_index > t.bar
+        if t.pending
+            slHit = isL ? low <= t.sl : high >= t.sl
+            tpHit = isL ? high >= t.tp : low <= t.tp
+            if not t.touched and (isL ? low <= t.pendLvl : high >= t.pendLvl)
+                t.touched := true
+            conf = t.touched and (isL ? close > open and close > t.pendLvl : close < open and close < t.pendLvl)
+            if slHit or tpHit or bar_index - t.bar > sniperBars
+                s.missed := s.missed + 1
+                line.set_x2(t.lnSl, bar_index)
+                line.set_x2(t.lnTp, bar_index)
+                label.set_text(t.tag, label.get_text(t.tag) + " ✗")
+                t.status  := "MISSED (no pullback fill)"
+                t.pending := false
+                t.dir     := 0
+                if alrt
+                    alert("APEX Q7 " + t.name + " " + syminfo.ticker + ": sniper order missed / cancelled", alert.freq_all)
+            else if conf
+                t.entry   := close
+                t.risk    := math.abs(close - t.sl)
+                t.rr      := math.abs(t.tp - close) / math.abs(close - t.sl)
+                t.costR   := t.sprPx / math.abs(close - t.sl)
+                t.t0      := time
+                t.bar     := bar_index
+                t.pending := false
+                t.status  := "RUNNING (sniper fill)"
+                line.set_x2(t.lnSl, bar_index)
+                line.set_x2(t.lnTp, bar_index)
+                fl = label.new(bar_index, close, "◆", style = label.style_label_left, color = color.new(color.gray, 100),
+                     textcolor = isL ? color.lime : color.red, size = size.small,
+                     tooltip = t.name + " sniper fill " + fmt(close) + " · R:R " + str.tostring(t.rr, "#.##"))
+                array.push(lbs, fl)
+                if alrt
+                    alert("APEX Q7 " + t.name + " " + (isL ? "BUY" : "SELL") + " sniper FILL " + syminfo.ticker +
+                         "\nEntry: " + fmt(close) + "\nSL: " + fmt(t.sl) + "\nTP: " + fmt(t.tp), alert.freq_all)
+            else
+                line.set_x2(t.lnSl, bar_index)
+                line.set_x2(t.lnTp, bar_index)
+        else
+            hitSL = isL ? low <= t.sl : high >= t.sl
+            hitTP = isL ? high >= t.tp : low <= t.tp
+            favR  = (isL ? high - t.entry : t.entry - low) / t.risk
+            advR  = (isL ? t.entry - low : high - t.entry) / t.risk
+            opnR  = (isL ? close - t.entry : t.entry - close) / t.risk
+            canP  = usePartial and t.rr > 1.0
+            t.mae := math.max(t.mae, advR)
+            if not hitSL
+                t.mfe := math.max(t.mfe, favR)
+            if hitSL
+                f_close(t, s, t.be ? 0.5 : -1.0, t.be ? 0.0 : -1.0, t.be ? "BE" : "SL", alrt)
+            else if hitTP
+                f_close(t, s, canP ? 0.5 + 0.5 * t.rr : t.rr, t.rr, "TP", alrt)
+            else if time - t.t0 >= t.holdMs
+                f_close(t, s, t.be ? 0.5 + 0.5 * opnR : opnR, opnR, "TIME", alrt)
+            else
+                if canP and not t.be and favR >= 1.0
+                    t.be := true
+                    t.sl := t.entry
+                    line.set_x2(t.lnSl, bar_index)
+                    t.lnSl := line.new(bar_index, t.sl, bar_index, t.sl, color = colSL, width = 2, style = line.style_dotted)
+                    array.push(lns, t.lnSl)
+                    t.status := "RUNNING · 50% banked, SL at BE"
+                line.set_x2(t.lnSl, bar_index)
+                line.set_x2(t.lnTp, bar_index)
+    true
+
+// Best TP multiple from recorded MFE (conservative: a trade that exited at a TP below k counts its real exit).
+f_suggest(Stat s) =>
+    ks = array.from(0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0)
+    n  = array.size(s.mfeA)
+    float bestK = na
+    float bestE = na
+    if n > 0
+        for k in ks
+            acc = 0.0
+            for i = 0 to n - 1
+                m  = array.get(s.mfeA, i)
+                ex = array.get(s.exA, i)
+                acc += (m >= k ? k : math.min(ex, k)) - array.get(s.costA, i)
+            e = acc / n
+            if na(bestE) or e > bestE
+                bestE := e
+                bestK := k
+    medMae = array.size(s.maeW) > 0 ? array.median(s.maeW) : na
+    [bestK, bestE, medMae]
+
+f_trim(array<line> lns, array<label> lbs) =>
+    while array.size(lns) > keepN * 3
+        line.delete(array.shift(lns))
+    while array.size(lbs) > keepN * 2
+        label.delete(array.shift(lbs))
+    true
+
+// ═══════════════════════ MAIN ═══════════════════════
+chartSec = timeframe.in_seconds()
+atrC     = ta.atr(14)
+
+// Mirrored timeframes (confirmed HTF bars only)
+[s1, e1, sl1, tp1, rr1, st1, hi1, lo1, b1, rg1] = request.security(syminfo.tickerid, tf1, f_engineHTF(), lookahead = barmerge.lookahead_on)
+[s2, e2, sl2, tp2, rr2, st2, hi2, lo2, b2, rg2] = request.security(syminfo.tickerid, tf2, f_engineHTF(), lookahead = barmerge.lookahead_on)
+[s3, e3, sl3, tp3, rr3, st3, hi3, lo3, b3, rg3] = request.security(syminfo.tickerid, tf3, f_engineHTF(), lookahead = barmerge.lookahead_on)
+en1  = useTF1 and timeframe.in_seconds(tf1) > chartSec
+en2  = useTF2 and timeframe.in_seconds(tf2) > chartSec
+en3  = useTF3 and timeframe.in_seconds(tf3) > chartSec
+chg1 = timeframe.change(tf1)
+chg2 = timeframe.change(tf2)
+chg3 = timeframe.change(tf3)
+new1 = en1 and chg1 and nz(s1) != 0 and not na(sl1)
+new2 = en2 and chg2 and nz(s2) != 0 and not na(sl2)
+new3 = en3 and chg3 and nz(s3) != 0 and not na(sl3)
+bb1  = en1 ? nz(b1) : 0
+bb2  = en2 ? nz(b2) : 0
+bb3  = en3 ? nz(b3) : 0
+upAny = bb1 == 1 or bb2 == 1 or bb3 == 1
+dnAny = bb1 == -1 or bb2 == -1 or bb3 == -1
+anyEn = en1 or en2 or en3
+alignOn  = alignMode == "On" or (alignMode == "Auto" and chartSec <= 300)
+allowDir = not alignOn or not anyEn ? 0 : upAny and not dnAny ? 1 : dnAny and not upAny ? -1 : 9
+
+// Chart timeframe engine
+[cSig, cEn, cSl, cTp, cRR, cSt, cHi, cLo, cBias, cReg] = f_engine(allowDir)
+chartIntra = modeIn == "Intraday" or (modeIn == "Auto" and chartSec <= 3600)
+
+var Trade tC = Trade.new()
+var Trade t1 = Trade.new()
+var Trade t2 = Trade.new()
+var Trade t3 = Trade.new()
+var Stat  sC = f_newStat()
+var Stat  S1 = f_newStat()
+var Stat  S2 = f_newStat()
+var Stat  S3 = f_newStat()
+var lnC = array.new<line>()
+var ln1 = array.new<line>()
+var ln2 = array.new<line>()
+var ln3 = array.new<line>()
+var lbC = array.new<label>()
+var lb1 = array.new<label>()
+var lb2 = array.new<label>()
+var lb3 = array.new<label>()
+var int lastDir = 0
+
+// 1) advance open trades on each confirmed candle
+if barstate.isconfirmed
+    f_update(tC, sC, alExits, lnC, lbC)
+    f_update(t1, S1, alExits, ln1, lb1)
+    f_update(t2, S2, alExits, ln2, lb2)
+    f_update(t3, S3, alExits, ln3, lb3)
+
+// 2) chart-timeframe signal (on candle close)
+alignedC = (cSig == 1 and upAny and not dnAny) or (cSig == -1 and dnAny and not upAny)
+if barstate.isconfirmed and cSig != 0 and tC.dir == 0
+    nmC  = f_tfName(timeframe.period)
+    txtC = (cSig == 1 ? "BUY" : "SELL") + (alignedC ? " A+" : "")
+    sprC = (chartIntra ? spreadTk : spreadTkSw) * syminfo.mintick
+    f_open(tC, cSig, cEn, cSl, cTp, f_holdMs(chartSec), sprC, false, na, nmC, f_setupName(cSt), txtC,
+         cSig == 1 ? color.new(color.green, 10) : color.new(color.red, 10), 0, atrC, lnC, lbC)
+    lastDir := cSig
+    if alChart
+        alert("APEX Q7 " + nmC + " " + txtC + " · " + f_setupName(cSt) + " · " + syminfo.ticker +
+             "\nEntry: " + fmt(cEn) + "\nSL: " + fmt(cSl) + "\nTP: " + fmt(cTp) + " (" + str.tostring(cRR, "#.##") + "R)",
+             alert.freq_all)
+
+// 3) mirrored HTF signals — shown on the FIRST tick of the first chart candle after the
+//    HTF close (HTF values are already final, so this cannot repaint) → alert within seconds.
+f_mirror(Trade t, Stat s, int sig, float en, float sl, float tp, int st, float hi, float lo, string tf,
+     int slot, color col, array<line> lns, array<label> lbs) =>
+    if t.dir != 0
+        // previous mirrored trade still open (e.g. time-stop timing) → close it at market
+        opnR = (t.dir == 1 ? close - t.entry : t.entry - close) / t.risk
+        if t.pending
+            t.pending := false
+            t.dir     := 0
+            line.set_x2(t.lnSl, bar_index)
+            line.set_x2(t.lnTp, bar_index)
+        else
+            f_close(t, s, t.be ? 0.5 + 0.5 * opnR : opnR, opnR, "TIME", false)
+    nm   = f_tfName(tf)
+    spr  = (timeframe.in_seconds(tf) <= 3600 or modeIn == "Intraday" ? spreadTk : spreadTkSw) * syminfo.mintick
+    mid  = (hi + lo) / 2.0
+    lvl  = sig == 1 ? math.min(en, math.max(mid, en - 0.25 * atrC)) : math.max(en, math.min(mid, en + 0.25 * atrC))
+    pend = useSniper and lvl != en
+    txt  = nm + (sig == 1 ? " BUY" : " SELL")
+    f_open(t, sig, en, sl, tp, f_holdMs(timeframe.in_seconds(tf)), spr, pend, pend ? lvl : na, nm, f_setupName(st), txt,
+         col, slot, atrC, lns, lbs)
+    "APEX Q7 " + txt + " · " + f_setupName(st) + " · " + syminfo.ticker +
+         "\nEntry: " + fmt(en) + (pend ? " (sniper ≤ " + fmt(lvl) + ")" : "") + "\nSL: " + fmt(sl) + "\nTP: " + fmt(tp)
+
+// One alert() call site per timeframe; varip marks the bar so each fires once, on the first tick.
+varip int alBar1 = -1
+varip int alBar2 = -1
+varip int alBar3 = -1
+if new1
+    msg1 = f_mirror(t1, S1, s1, e1, sl1, tp1, st1, hi1, lo1, tf1, 1, color.new(color.orange, 5), ln1, lb1)
+    if alTF1 and alBar1 != bar_index
+        alBar1 := bar_index
+        alert(msg1, alert.freq_all)
+if new2
+    msg2 = f_mirror(t2, S2, s2, e2, sl2, tp2, st2, hi2, lo2, tf2, 2, color.new(color.purple, 5), ln2, lb2)
+    if alTF2 and alBar2 != bar_index
+        alBar2 := bar_index
+        alert(msg2, alert.freq_all)
+if new3
+    msg3 = f_mirror(t3, S3, s3, e3, sl3, tp3, st3, hi3, lo3, tf3, 3, color.new(color.teal, 5), ln3, lb3)
+    if alTF3 and alBar3 != bar_index
+        alBar3 := bar_index
+        alert(msg3, alert.freq_all)
+
+f_trim(lnC, lbC)
+f_trim(ln1, lb1)
+f_trim(ln2, lb2)
+f_trim(ln3, lb3)
+
+// Data Window only (nothing drawn)
+plot(tC.dir != 0 ? tC.entry : na, "Entry", color = color.gray, display = display.data_window)
+plot(tC.dir != 0 ? tC.sl    : na, "SL",    color = colSL,      display = display.data_window)
+plot(tC.dir != 0 ? tC.tp    : na, "TP",    color = colTP,      display = display.data_window)
+
+// ─────────────────────────── TABLES ───────────────────────────
+colBg  = color.rgb(18, 20, 26)
+colHdr = color.rgb(35, 38, 48)
+colOK  = color.rgb(70, 220, 90)
+colBad = color.rgb(255, 90, 90)
+
+biasTxt(bool en, int b, Trade t) =>
+    not en ? "off" : (t.dir == 1 ? "BUY ● " : t.dir == -1 ? "SELL ● " : "") + (b == 1 ? "↑" : b == -1 ? "↓" : "—")
+
+var table tt = table.new(position.top_right, 2, 11, bgcolor = colBg,
+     frame_width = 1, frame_color = color.new(color.gray, 40),
+     border_width = 1, border_color = color.new(color.gray, 70))
+if showTrade and barstate.islast
+    hdrBg  = tC.dir == 1 ? color.rgb(0, 110, 50) : tC.dir == -1 ? color.rgb(150, 25, 25) : colHdr
+    hdrTxt = tC.dir == 1 ? "BUY ●" : tC.dir == -1 ? "SELL ●" : lastDir == 1 ? "LAST BUY" : lastDir == -1 ? "LAST SELL" : "WAIT"
+    has    = sC.n > 0 or tC.dir != 0
+    regTxt = cReg == 1 ? "TREND" : cReg == 2 ? "RANGE" : "STAND ASIDE"
+    alTxt  = not anyEn ? "—" : upAny and not dnAny ? "ALIGNED ↑  A+ longs" : dnAny and not upAny ? "ALIGNED ↓  A+ shorts" : "MIXED / NEUTRAL"
+    table.cell(tt, 0, 0, "APEX Q7 · " + f_tfName(timeframe.period), text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+    table.cell(tt, 1, 0, hdrTxt, text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+    table.cell(tt, 0, 1, "Regime", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 1, regTxt, text_color = color.aqua, text_size = size.small)
+    table.cell(tt, 0, 2, "Setup", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 2, has ? tC.setup + " · " + tC.sigTime : "—", text_color = color.white, text_size = size.small)
+    table.cell(tt, 0, 3, "Entry", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 3, has ? fmt(tC.entry) : "—", text_color = color.white, text_size = size.small)
+    table.cell(tt, 0, 4, "SL", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 4, has ? fmt(tC.sl) : "—", text_color = colBad, text_size = size.small)
+    table.cell(tt, 0, 5, "TP", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 5, has ? fmt(tC.tp) + " (" + str.tostring(tC.rr, "#.##") + "R)" : "—", text_color = color.rgb(90, 150, 255), text_size = size.small)
+    table.cell(tt, 0, 6, "Status", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 6, has ? tC.status : "—", text_color = color.yellow, text_size = size.small)
+    table.cell(tt, 0, 7, en1 ? f_tfName(tf1) : "TF 1", text_color = color.orange, text_size = size.small)
+    table.cell(tt, 1, 7, biasTxt(en1, bb1, t1) + (t1.dir != 0 ? " · " + t1.status : ""), text_color = color.white, text_size = size.small)
+    table.cell(tt, 0, 8, en2 ? f_tfName(tf2) : "TF 2", text_color = color.purple, text_size = size.small)
+    table.cell(tt, 1, 8, biasTxt(en2, bb2, t2) + (t2.dir != 0 ? " · " + t2.status : ""), text_color = color.white, text_size = size.small)
+    table.cell(tt, 0, 9, en3 ? f_tfName(tf3) : "TF 3", text_color = color.teal, text_size = size.small)
+    table.cell(tt, 1, 9, biasTxt(en3, bb3, t3) + (t3.dir != 0 ? " · " + t3.status : ""), text_color = color.white, text_size = size.small)
+    table.cell(tt, 0, 10, "HTF alignment", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 10, alTxt + (alignOn ? " · filter ON" : ""), text_color = upAny != dnAny ? colOK : color.orange, text_size = size.small)
+
+f_statRow(table tb, int row, string nm, Stat s, color c) =>
+    dec  = s.wins + s.losses
+    wr   = dec > 0 ? 100.0 * s.wins / dec : 0.0
+    avgR = s.n > 0 ? s.sumRR / s.n : na
+    beWR = na(avgR) ? na : 100.0 / (1.0 + avgR)
+    pf   = s.gL > 0 ? s.gW / s.gL : na
+    ex   = s.n > 0 ? s.net / s.n : na
+    table.cell(tb, 0, row, nm, text_color = c, text_size = size.tiny)
+    table.cell(tb, 1, row, str.tostring(s.n), text_color = color.white, text_size = size.tiny)
+    table.cell(tb, 2, row, dec > 0 ? str.tostring(wr, "#.#") + "% (" + (na(beWR) ? "—" : str.tostring(beWR, "#")) + "%)" : "—",
+         text_color = not na(beWR) and wr > beWR ? colOK : color.orange, text_size = size.tiny)
+    table.cell(tb, 3, row, na(pf) ? "—" : str.tostring(pf, "#.##"), text_color = nz(pf) >= 1.3 ? colOK : color.orange, text_size = size.tiny)
+    table.cell(tb, 4, row, na(ex) ? "—" : str.tostring(ex, "#.##"), text_color = nz(ex) > 0 ? colOK : colBad, text_size = size.tiny)
+    table.cell(tb, 5, row, pctTxt(s.cSL, s.n), text_color = s.n > 0 and s.cSL * 2 < s.n ? colOK : color.orange, text_size = size.tiny)
+    table.cell(tb, 6, row, str.tostring(s.missed), text_color = color.silver, text_size = size.tiny)
+    true
+
+var table st = table.new(position.bottom_right, 7, 5, bgcolor = colBg,
+     frame_width = 1, frame_color = color.new(color.gray, 40),
+     border_width = 1, border_color = color.new(color.gray, 70))
+var table mt = table.new(position.bottom_left, 2, 9, bgcolor = colBg,
+     frame_width = 1, frame_color = color.new(color.gray, 40),
+     border_width = 1, border_color = color.new(color.gray, 70))
+if showStats and barstate.islast
+    hc = color.rgb(25, 60, 130)
+    table.cell(st, 0, 0, "Source", text_color = color.white, bgcolor = hc, text_size = size.tiny)
+    table.cell(st, 1, 0, "Trades", text_color = color.white, bgcolor = hc, text_size = size.tiny)
+    table.cell(st, 2, 0, "Win % (break-even)", text_color = color.white, bgcolor = hc, text_size = size.tiny)
+    table.cell(st, 3, 0, "PF", text_color = color.white, bgcolor = hc, text_size = size.tiny)
+    table.cell(st, 4, 0, "Exp R", text_color = color.white, bgcolor = hc, text_size = size.tiny)
+    table.cell(st, 5, 0, "SL-first", text_color = color.white, bgcolor = hc, text_size = size.tiny)
+    table.cell(st, 6, 0, "Missed", text_color = color.white, bgcolor = hc, text_size = size.tiny)
+    f_statRow(st, 1, f_tfName(timeframe.period) + " (chart)", sC, color.white)
+    f_statRow(st, 2, en1 ? f_tfName(tf1) : "TF1 off", S1, color.orange)
+    f_statRow(st, 3, en2 ? f_tfName(tf2) : "TF2 off", S2, color.purple)
+    f_statRow(st, 4, en3 ? f_tfName(tf3) : "TF3 off", S3, color.teal)
+
+    sA = anaSrc == "Mirror TF 1" ? S1 : anaSrc == "Mirror TF 2" ? S2 : anaSrc == "Mirror TF 3" ? S3 : sC
+    [bk, be, mm] = f_suggest(sA)
+    curTP = sA.n > 0 ? sA.sumRR / sA.n : na
+    slTxt = na(mm) ? "—" : mm >= 0.7 ? "SL too tight (winners' median MAE " + str.tostring(mm, "#.##") + "R)" :
+         "SL OK (winners' median MAE " + str.tostring(mm, "#.##") + "R)"
+    table.cell(mt, 0, 0, "MAE / MFE · " + anaSrc, text_color = color.white, bgcolor = hc, text_size = size.tiny)
+    table.cell(mt, 1, 0, "net of cost · no partials", text_color = color.white, bgcolor = hc, text_size = size.tiny)
+    table.cell(mt, 0, 1, "Reached 0.5R before SL", text_color = color.silver, text_size = size.tiny)
+    table.cell(mt, 1, 1, pctTxt(sA.r05, sA.n), text_color = color.white, text_size = size.tiny)
+    table.cell(mt, 0, 2, "Reached 1.0R before SL", text_color = color.silver, text_size = size.tiny)
+    table.cell(mt, 1, 2, pctTxt(sA.r10, sA.n), text_color = color.white, text_size = size.tiny)
+    table.cell(mt, 0, 3, "Reached 1.5R before SL", text_color = color.silver, text_size = size.tiny)
+    table.cell(mt, 1, 3, pctTxt(sA.r15, sA.n), text_color = color.white, text_size = size.tiny)
+    table.cell(mt, 0, 4, "Reached 2.0R before SL", text_color = color.silver, text_size = size.tiny)
+    table.cell(mt, 1, 4, pctTxt(sA.r20, sA.n), text_color = color.white, text_size = size.tiny)
+    table.cell(mt, 0, 5, "Suggested TP (max expectancy)", text_color = color.silver, text_size = size.tiny)
+    table.cell(mt, 1, 5, na(bk) ? "—" : str.tostring(bk, "#.##") + "R → " + str.tostring(be, "#.##") + " R/trade (now avg " + str.tostring(curTP, "#.##") + "R)",
+         text_color = nz(be) > 0 ? colOK : colBad, text_size = size.tiny)
+    table.cell(mt, 0, 6, "Stop check", text_color = color.silver, text_size = size.tiny)
+    table.cell(mt, 1, 6, slTxt, text_color = nz(mm) >= 0.7 ? color.orange : colOK, text_size = size.tiny)
+    table.cell(mt, 0, 7, "Max DD / losing run", text_color = color.silver, text_size = size.tiny)
+    table.cell(mt, 1, 7, str.tostring(sA.maxDD, "#.##") + " R / " + str.tostring(sA.maxCons), text_color = color.white, text_size = size.tiny)
+    table.cell(mt, 0, 8, "Sample", text_color = color.silver, text_size = size.tiny)
+    table.cell(mt, 1, 8, sA.n < 100 ? str.tostring(sA.n) + " trades — too few to trust" : str.tostring(sA.n) + " trades",
+         text_color = sA.n < 100 ? color.orange : colOK, text_size = size.tiny)
+
+alertcondition(barstate.isconfirmed and cSig == 1,  "APEX Q7 chart BUY",  "APEX Q7 BUY {{ticker}} ({{interval}}) @ {{close}}")
+alertcondition(barstate.isconfirmed and cSig == -1, "APEX Q7 chart SELL", "APEX Q7 SELL {{ticker}} ({{interval}}) @ {{close}}")
+alertcondition(new1 or new2 or new3, "APEX Q7 HTF mirror signal", "APEX Q7 HTF signal on {{ticker}} @ {{close}}")
+// ═══ END OF APEX QUANT v7 ═══

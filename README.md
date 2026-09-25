@@ -39,3 +39,8 @@ Trend-pullback + breakout system for intraday (1m–1h, e.g. XAUUSD) and swing /
 - Swing / Invest mode is long-only by default.
 - Stats: win %, the break-even win % for the chosen TP, profit factor, net R.
 After adding: indicator ⋯ → Pin to scale → Pin to right scale.
+
+---
+
+# APEX Quant v6 — `APEX_Quant_v6.pine`
+Regime-adaptive (Trend / Range / Stand-aside) intraday + swing indicator. See `APEX_Quant_v6_GUIDE.md`.

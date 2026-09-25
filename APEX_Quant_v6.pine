@@ -1,0 +1,509 @@
+//@version=6
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  APEX QUANT v6 — Regime-Adaptive Intraday & Swing                 ║
+// ║  1. Regime: TREND / RANGE / STAND-ASIDE (ADX, ADX slope,          ║
+// ║     Choppiness Index, ATR percentile)                             ║
+// ║  2. TREND  → buy/sell the PULLBACK (EMA-21 touch or 38–62% retr.) ║
+// ║              after a confirmation close; anti-chase filter        ║
+// ║  3. RANGE  → fade Bollinger(20,2) extremes with RSI(2) exhaustion ║
+// ║              + rejection wick; target = mid-band                  ║
+// ║  4. SWING (4H/D/W, e.g. CSE Sri Lanka): long-only trend template  ║
+// ║     close > EMA50 > EMA200, near 52-bar high, volume confirmation ║
+// ║  5. Structural SL + buffer, ATR / HTF-ATR floor, skip if too wide ║
+// ║  6. One SL (red) + one TP (blue) line, ending on the touch candle ║
+// ║  7. Cooldowns, duplicate-signal suppression, daily cap, session   ║
+// ║  8. Stats net of spread: win %, break-even %, PF, expectancy,     ║
+// ║     max consecutive losses, max drawdown, exit mix, trades/day    ║
+// ║  Non-repainting: bar-close signals; HTF = confirmed bars only.    ║
+// ║  Research tool. No indicator is guaranteed accurate — judge it by ║
+// ║  the stats table over 100+ trades, out-of-sample, after costs.    ║
+// ╠══════════════════════════════════════════════════════════════════╣
+// ║  COPY THE WHOLE FILE. Last line: // ═══ END OF APEX QUANT v6 ═══   ║
+// ╚══════════════════════════════════════════════════════════════════╝
+indicator("APEX Quant v6", "APEX Q6", overlay = true, scale = scale.right,
+     max_lines_count = 500, max_labels_count = 500)
+
+// ───────────────────────────── INPUTS ─────────────────────────────
+grpM    = "⚡ Mode"
+modeIn  = input.string("Auto", "Mode", options = ["Auto", "Intraday", "Swing / Invest"], group = grpM,
+     tooltip = "Auto: 1m–1h = Intraday, 4H / D / W = Swing / Invest.")
+freqIn  = input.string("Normal", "Signal frequency", options = ["Active", "Normal", "Conservative"], group = grpM,
+     tooltip = "Active = looser regime thresholds and shorter cooldowns (more trades). Conservative = fewer, stricter.")
+dirIn   = input.string("Auto", "Direction", options = ["Auto", "Both", "Long only"], group = grpM,
+     tooltip = "Auto: Intraday = Both; Swing / Invest = Long only (retail shorting is generally not available on CSE).")
+tzIn    = input.string("GMT+4", "Your timezone (signal time, day reset, session)", group = grpM)
+
+grpSet  = "🎯 Setups"
+useTrendSetup = input.bool(true, "Trend pullback setup", group = grpSet)               // core continuation edge
+useRangeSetup = input.bool(true, "Range fade setup (intraday only)", group = grpSet)   // main source of intraday frequency
+useSwingBO    = input.bool(true, "Swing breakout setup (swing only)", group = grpSet) // 20-bar breakout with volume in uptrends
+chaseATR      = input.float(1.2, "Anti-chase: max distance from EMA-21 (× ATR)", minval = 0.3, step = 0.1, group = grpSet) // later entries have worse R:R
+nearHighPct   = input.float(25.0, "Swing: within X% of 52-bar high", minval = 1, maxval = 100, group = grpSet) // trend-template leadership filter
+swingVolMult  = input.float(1.5, "Swing breakout: volume ≥ X × 20-bar avg", minval = 0.5, step = 0.1, group = grpSet) // real breakouts come with volume
+
+grpR     = "🛡 Risk & exits"
+tpIntra  = input.float(1.3, "TP (R) — intraday trend", minval = 0.5, maxval = 10, step = 0.1, group = grpR)  // 1.0–1.5R: high hit-rate, still > costs
+tpSwing  = input.float(2.5, "TP (R) — swing / invest", minval = 0.5, maxval = 10, step = 0.1, group = grpR)  // swings run further; 2–3R
+minRangeRR = input.float(0.8, "Range fade: min R to mid-band (skip if less)", minval = 0.3, step = 0.1, group = grpR) // no tiny-reward fades
+maxRangeRR = input.float(2.0, "Range fade: cap R", minval = 0.5, step = 0.1, group = grpR)                             // mid-band beyond this is unrealistic
+floorATR   = input.float(1.2, "SL floor (× chart ATR)", minval = 0.3, step = 0.1, group = grpR)            // keeps stops outside normal noise
+floorHtf   = input.float(0.5, "SL floor (× higher-TF ATR), 0 = off", minval = 0, step = 0.05, group = grpR) // fixes too-tight 1m stops
+bufATR     = input.float(0.3, "SL buffer beyond swing (× ATR)", minval = 0, step = 0.05, group = grpR)      // avoids stop-hunt wicks
+maxRiskATR = input.float(3.0, "Skip if SL wider than (× ATR)", minval = 1, step = 0.1, group = grpR)       // bad location → skip, never shrink stop
+spreadTk   = input.int(30, "Spread / cost (ticks), intraday", minval = 0, group = grpR)                     // XAUUSD 30 ticks = 0.30
+spreadTkSw = input.int(2, "Spread / cost (ticks), swing", minval = 0, group = grpR)                         // liquid stocks: ~1–2 ticks
+beAtR      = input.float(0.0, "Move SL to break-even at R (0 = off)", minval = 0, step = 0.1, group = grpR)  // off: BE too early cuts winners
+useTrail   = input.bool(false, "At TP: bank 50%, trail the rest (ATR)", group = grpR)                          // optional runner mode
+trailATR   = input.float(2.0, "Trail distance (× ATR)", minval = 0.5, step = 0.1, group = grpR)
+iMaxHold   = input.int(0, "Time-stop (bars, 0 = auto)", minval = 0, group = grpR,
+     tooltip = "Auto: 1m=90, 5m=48, 15m=32, 1h=24, swing=60 bars. Closes the trade at market.")
+
+grpS     = "🕒 Session & limits"
+sessMode = input.string("Auto", "Session filter", options = ["Auto", "On", "Off"], group = grpS,
+     tooltip = "Auto = ON for 1m–5m only (thin Asian hours are noise on very low timeframes).")
+sessIn   = input.session("1100-0100", "Session (your timezone)", group = grpS)   // London open → NY close in GMT+4
+maxDay   = input.int(10, "Max trades per day (intraday)", minval = 1, maxval = 50, group = grpS)
+
+grpAL      = "🔔 Alerts (sound + pop-up)"
+alertsOn   = input.bool(true, "Send entry alerts", group = grpAL,
+     tooltip = "Create ONE alert: Condition = APEX Q6 → 'Any alert() function call', tick Show pop-up + Play sound. Untick here or pause the alert to silence.")
+alertExits = input.bool(true, "Send exit alerts (TP / SL / BE / time)", group = grpAL)
+
+grpUI      = "Display"
+keepTrades = input.int(20, "Keep last N trades on chart", minval = 1, maxval = 100, group = grpUI)
+showBands  = input.bool(false, "Show EMA 21 / Bollinger bands", group = grpUI)
+showRegime = input.bool(false, "Tint background by regime", group = grpUI)
+showTrade  = input.bool(true, "Show trade table", group = grpUI)
+showStats  = input.bool(true, "Show stats table", group = grpUI)
+
+// ─────────────────────── MODE / PRESETS ───────────────────────
+tfSec    = timeframe.in_seconds()
+isIntra  = modeIn == "Intraday" or (modeIn == "Auto" and tfSec <= 3600)
+longOnly = dirIn == "Long only" or (dirIn == "Auto" and not isIntra)
+isAct    = freqIn == "Active"
+isCons   = freqIn == "Conservative"
+
+adxTrend    = isAct ? 18.0 : isCons ? 23.0 : 20.0   // ADX needed for "trend"
+chopTrendMx = isAct ? 58.0 : isCons ? 50.0 : 55.0   // CHOP below = trending
+chopRangeMn = isAct ? 42.0 : isCons ? 50.0 : 45.0   // CHOP above = ranging
+rsiLo       = isAct ? 15.0 : isCons ? 5.0  : 10.0   // RSI(2) oversold for range longs
+rsiHi       = 100.0 - rsiLo
+cdBars      = isAct ? 2 : isCons ? 5 : 3            // cooldown after any exit
+cdLossBars  = cdBars * 2                            // longer cooldown after a stop-out
+dupBars     = isAct ? 6 : isCons ? 12 : 8           // no same-direction re-entry within N bars
+dupATR      = 1.0                                   // …or within 1 ATR of the last same-direction entry
+
+tpTrend = isIntra ? tpIntra : tpSwing
+spread  = (isIntra ? spreadTk : spreadTkSw) * syminfo.mintick
+useSess = sessMode == "On" or (sessMode == "Auto" and isIntra and tfSec <= 300)
+maxHold = iMaxHold > 0 ? iMaxHold : not isIntra ? 60 :
+     tfSec <= 60 ? 90 : tfSec <= 300 ? 48 : tfSec <= 900 ? 32 : 24
+
+// Higher TF: 1m/3m→15m | 5m→60m | 15m→60m | 30m→4h | 1h→4h | 4h→D | D→W | W→M
+autoHTF() =>
+    p = timeframe.period
+    p == "1" ? "15" : p == "3" ? "15" : p == "5" ? "60" : p == "15" ? "60" : p == "30" ? "240" :
+     p == "60" ? "240" : p == "240" ? "D" : p == "1D" or p == "D" ? "W" : p == "1W" or p == "W" ? "M" : "D"
+htfTF = autoHTF()
+
+// Confirmed HTF bar only ([1] + lookahead_on) → no repainting, no future leak
+f_htf() =>
+    e = ta.ema(close, 50)
+    a = ta.atr(14)
+    [close[1], e[1], a[1]]
+[hC, hE, hA] = request.security(syminfo.tickerid, htfTF, f_htf(), lookahead = barmerge.lookahead_on)
+htfUp = na(hE) or hC > hE
+htfDn = na(hE) or hC < hE
+
+// ─────────────── CORE SERIES (every ta.* computed once per bar, global scope) ───────────────
+ema9   = ta.ema(close, 9)
+ema21  = ta.ema(close, 21)
+ema50  = ta.ema(close, 50)
+ema55  = ta.ema(close, 55)
+ema200 = ta.ema(close, 200)
+atr14  = ta.atr(14)
+rsi2   = ta.rsi(close, 2)
+rsi2Lo3 = ta.lowest(rsi2, 3)
+rsi2Hi3 = ta.highest(rsi2, 3)
+[diP, diM, adxV] = ta.dmi(14, 14)
+adxSlope = adxV - adxV[3]
+trSum  = math.sum(ta.tr(true), 14)
+rng14  = ta.highest(high, 14) - ta.lowest(low, 14)
+chop   = rng14 > 0 ? 100.0 * math.log10(trSum / rng14) / math.log10(14) : 50.0
+atrPct = ta.percentrank(atr14, 100)
+[bbMid, bbUp, bbLo] = ta.bb(close, 20, 2.0)
+vwapV  = ta.vwap(hlc3)
+volAvg = ta.sma(volume, 20)
+hh20   = ta.highest(high, 20)
+ll20   = ta.lowest(low, 20)
+hh52   = ta.highest(high, 52)
+lowPB  = ta.lowest(low, 5)
+highPB = ta.highest(high, 5)
+swLo3  = ta.lowest(low, 3)
+swHi3  = ta.highest(high, 3)
+
+hasVol = not na(volAvg) and volAvg > 0
+barRng = high - low
+
+// ─────────────────────── REGIME ───────────────────────
+isTrendReg = adxV >= adxTrend and (adxSlope >= 0 or adxV >= 30) and chop < chopTrendMx and atrPct < 97
+isRangeReg = adxV < adxTrend and chop >= chopRangeMn and atrPct <= 85
+regime     = isTrendReg ? 1 : isRangeReg ? 2 : 0     // 0 = stand aside (chop / volatility spike)
+
+upBias = ema21 > ema55 and close > ema55 and htfUp and diP > diM
+dnBias = ema21 < ema55 and close < ema55 and htfDn and diM > diP
+if isIntra and not na(vwapV)
+    upBias := upBias and close > vwapV
+    dnBias := dnBias and close < vwapV
+if not isIntra
+    upBias := upBias and close > ema50 and ema50 > ema200 and close >= hh52 * (1.0 - nearHighPct / 100.0)
+    dnBias := dnBias and close < ema50 and ema50 < ema200
+
+// ─────────────────────── SETUP TRIGGERS ───────────────────────
+impRng = hh20 - ll20
+retrL  = impRng > 0 ? (hh20 - lowPB) / impRng : 0.0     // how deep the recent dip retraced the 20-bar range
+retrS  = impRng > 0 ? (highPB - ll20) / impRng : 0.0
+pbL    = lowPB  <= ema21 + 0.25 * atr14 or (retrL >= 0.382 and retrL <= 0.618)
+pbS    = highPB >= ema21 - 0.25 * atr14 or (retrS >= 0.382 and retrS <= 0.618)
+confL  = close > open and close > high[1] and close - open >= 0.3 * atr14 and close > ema21
+confS  = close < open and close < low[1]  and open - close >= 0.3 * atr14 and close < ema21
+chaseL = close - ema21 <= chaseATR * atr14
+chaseS = ema21 - close <= chaseATR * atr14
+volSwingPB = not hasVol or volume >= volAvg
+volSwingBO = not hasVol or volume >= swingVolMult * volAvg
+
+trendLong  = useTrendSetup and regime == 1 and upBias and pbL and confL and chaseL and (isIntra or volSwingPB)
+trendShort = useTrendSetup and regime == 1 and dnBias and pbS and confS and chaseS and (isIntra or volSwingPB)
+
+wickL = barRng > 0 and math.min(open, close) - low  >= 0.4 * barRng
+wickS = barRng > 0 and high - math.max(open, close) >= 0.4 * barRng
+rangeLong  = useRangeSetup and isIntra and regime == 2 and low  <= bbLo and close > bbLo and wickL and rsi2Lo3 < rsiLo and close < bbMid
+rangeShort = useRangeSetup and isIntra and regime == 2 and high >= bbUp and close < bbUp and wickS and rsi2Hi3 > rsiHi and close > bbMid
+
+swingBOLong = useSwingBO and not isIntra and upBias and close > hh20[1] and close > open and volSwingBO and chaseL
+
+// ─────────────────────── SESSION / DAY ───────────────────────
+inSess = not na(time(timeframe.period, sessIn, tzIn))
+sessOK = not useSess or inSess
+dayKey = dayofmonth(time, tzIn)
+newDay = dayKey != dayKey[1]
+var int tradesToday = 0
+var int dayCount    = 0
+if newDay
+    tradesToday := 0
+    dayCount    += 1
+dayOK = not isIntra or tradesToday < maxDay
+
+// ─────────────────────── TRADE STATE ───────────────────────
+var int    tDir    = 0
+var int    lastDir = 0
+var string tSetup  = "—"
+var float  tEntry  = na
+var float  tSL     = na
+var float  tTP     = na
+var float  tRisk   = na
+var float  tTPR    = na
+var float  tCostR  = 0.0
+var int    tBar    = na
+var int    tStage  = 0          // 0 = before TP, 1 = trailing remainder
+var bool   tBE     = false
+var float  tTrail  = na
+var float  tBanked = 0.0
+var string tStatus  = "—"
+var string tSigTime = "—"
+
+var int   lastExitBar = na
+var bool  lastExitSL  = false
+var int   lastLongBar  = na
+var float lastLongPx   = na
+var int   lastShortBar = na
+var float lastShortPx  = na
+
+var int   nTrades = 0
+var int   nClosed = 0
+var int   nWins   = 0
+var int   nLoss   = 0
+var int   nBE     = 0
+var int   cSL     = 0
+var int   cTP     = 0
+var int   cBEx    = 0
+var int   cTrail  = 0
+var int   cTime   = 0
+var float netR    = 0.0
+var float grossW  = 0.0
+var float grossL  = 0.0
+var int   consec  = 0
+var int   maxConsec = 0
+var float peakR   = 0.0
+var float maxDD   = 0.0
+
+var line lSl = na
+var line lTp = na
+var tradeLines = array.new<line>()
+var sigLabels  = array.new<label>()
+
+colSL = color.new(color.red, 0)
+colTP = color.new(color.blue, 0)
+
+fmt(float v) =>
+    na(v) ? "—" : str.tostring(v, format.mintick)
+
+// Share of closed trades, as text (declared at global scope — Pine forbids local functions)
+pc(int c, int total) =>
+    total > 0 ? str.tostring(100.0 * c / total, "#") + "%" : "—"
+
+// ─────────────── TRADE MANAGEMENT (runs before new entries) ───────────────
+// From the bar after entry. SL and TP touched in the same candle → SL (conservative).
+float  exitR   = na
+string exitTyp = ""
+if tDir != 0 and bar_index > tBar
+    if tStage == 0
+        hitSL = tDir == 1 ? low <= tSL : high >= tSL
+        hitTP = tDir == 1 ? high >= tTP : low <= tTP
+        if hitSL
+            exitR   := tDir * (tSL - tEntry) / tRisk
+            exitTyp := tBE ? "BE" : "SL"
+        else if hitTP
+            if useTrail
+                tBanked := 0.5 * tTPR
+                tStage  := 1
+                tBE     := true
+                tSL     := tEntry
+                tTrail  := tDir == 1 ? math.max(tEntry, close - trailATR * atr14) : math.min(tEntry, close + trailATR * atr14)
+                line.set_x2(lSl, bar_index)
+                line.set_x2(lTp, bar_index)
+                tStatus := "TP ✓ 50% · trailing"
+                if alertsOn and alertExits
+                    alert("APEX Q6 " + syminfo.ticker + " (" + timeframe.period + ") TP hit, 50% banked, trailing rest",
+                         alert.freq_once_per_bar_close)
+            else
+                exitR   := tTPR
+                exitTyp := "TP"
+        else if beAtR > 0 and not tBE
+            beHit = tDir == 1 ? high >= tEntry + beAtR * tRisk : low <= tEntry - beAtR * tRisk
+            if beHit
+                tBE := true
+                tSL := tEntry
+                line.set_x2(lSl, bar_index)
+                lSl := line.new(bar_index, tSL, bar_index, tSL, color = colSL, width = 2, style = line.style_dotted)
+                array.push(tradeLines, lSl)
+                tStatus := "RUNNING · SL at BE"
+    else
+        hitTr = tDir == 1 ? low <= tTrail : high >= tTrail
+        if hitTr
+            exitR   := tBanked + 0.5 * tDir * (tTrail - tEntry) / tRisk
+            exitTyp := "TRAIL"
+        else
+            tTrail := tDir == 1 ? math.max(tTrail, close - trailATR * atr14) : math.min(tTrail, close + trailATR * atr14)
+    if na(exitR) and bar_index - tBar >= maxHold
+        openR   = tDir * (close - tEntry) / tRisk
+        exitR   := tStage == 0 ? openR : tBanked + 0.5 * openR
+        exitTyp := "TIME"
+
+if not na(exitR)
+    if tStage == 0
+        line.set_x2(lSl, bar_index)
+        line.set_x2(lTp, bar_index)
+    netTrade = exitR - tCostR
+    nClosed += 1
+    netR    += netTrade
+    if exitTyp == "BE"
+        nBE    += 1
+        grossL += tCostR
+    else if netTrade > 0
+        nWins  += 1
+        grossW += netTrade
+        consec := 0
+    else
+        nLoss  += 1
+        grossL += -netTrade
+        consec += 1
+        maxConsec := math.max(maxConsec, consec)
+    cSL    += exitTyp == "SL"    ? 1 : 0
+    cTP    += exitTyp == "TP"    ? 1 : 0
+    cBEx   += exitTyp == "BE"    ? 1 : 0
+    cTrail += exitTyp == "TRAIL" ? 1 : 0
+    cTime  += exitTyp == "TIME"  ? 1 : 0
+    peakR := math.max(peakR, netR)
+    maxDD := math.max(maxDD, peakR - netR)
+    tStatus := exitTyp == "TP" ? "TP HIT ✓" : exitTyp == "SL" ? "SL HIT ✗" : exitTyp == "BE" ? "BREAK-EVEN" :
+         exitTyp == "TRAIL" ? "TRAIL EXIT (" + str.tostring(exitR, "#.##") + "R)" :
+         "TIME EXIT (" + str.tostring(exitR, "#.##") + "R)"
+    if alertsOn and alertExits
+        alert("APEX Q6 " + syminfo.ticker + " (" + timeframe.period + ") " + (tDir == 1 ? "BUY" : "SELL") +
+             " closed: " + tStatus, alert.freq_once_per_bar_close)
+    lastExitBar := bar_index
+    lastExitSL  := exitTyp == "SL"
+    tDir := 0
+else if tDir != 0 and tStage == 0
+    line.set_x2(lSl, bar_index)
+    line.set_x2(lTp, bar_index)
+
+// ─────────────────────── ENTRY ───────────────────────
+coolNeed = lastExitSL ? cdLossBars : cdBars
+coolOK   = na(lastExitBar) or bar_index - lastExitBar >= coolNeed
+dupL     = not na(lastLongBar)  and (bar_index - lastLongBar  < dupBars or
+     (math.abs(close - lastLongPx)  < dupATR * atr14 and bar_index - lastLongBar  < 4 * dupBars))
+dupS     = not na(lastShortBar) and (bar_index - lastShortBar < dupBars or
+     (math.abs(close - lastShortPx) < dupATR * atr14 and bar_index - lastShortBar < 4 * dupBars))
+baseOK   = tDir == 0 and coolOK and sessOK and dayOK and barstate.isconfirmed and not na(atr14) and not na(adxV)
+
+buffer    = math.max(bufATR * atr14, spread)
+floorRisk = math.max(floorATR * atr14, floorHtf * nz(hA, 0.0))
+maxRisk   = math.max(maxRiskATR * atr14, 1.5 * floorRisk)
+
+// Long candidate (priority: trend pullback > swing breakout > range fade)
+setupL   = trendLong ? 1 : swingBOLong ? 3 : rangeLong ? 2 : 0
+structL  = setupL == 2 ? swLo3 : lowPB
+slL      = math.min(structL - buffer, close - floorRisk)
+rkL      = close - slL
+rrMidL   = rkL > 0 ? (bbMid - close) / rkL : 0.0
+tprL     = setupL == 2 ? math.min(rrMidL, maxRangeRR) : tpTrend
+okL      = setupL > 0 and rkL > 0 and rkL <= maxRisk and (setupL != 2 or rrMidL >= minRangeRR)
+
+setupS   = longOnly ? 0 : trendShort ? 1 : rangeShort ? 2 : 0
+structS  = setupS == 2 ? swHi3 : highPB
+slS      = math.max(structS + buffer, close + floorRisk)
+rkS      = slS - close
+rrMidS   = rkS > 0 ? (close - bbMid) / rkS : 0.0
+tprS     = setupS == 2 ? math.min(rrMidS, maxRangeRR) : tpTrend
+okS      = setupS > 0 and rkS > 0 and rkS <= maxRisk and (setupS != 2 or rrMidS >= minRangeRR)
+
+goLong  = baseOK and okL and not dupL
+goShort = baseOK and okS and not dupS and not goLong      // at most one signal per bar
+
+if goLong or goShort
+    dir   = goLong ? 1 : -1
+    stp   = goLong ? setupL : setupS
+    rk    = goLong ? rkL : rkS
+    tpr   = goLong ? tprL : tprS
+    tDir     := dir
+    lastDir  := dir
+    tSetup   := stp == 1 ? "Trend pullback" : stp == 2 ? "Range fade" : "Breakout"
+    tEntry   := close
+    tSL      := goLong ? slL : slS
+    tRisk    := rk
+    tTPR     := tpr
+    tTP      := close + dir * tpr * rk
+    tCostR   := spread / rk
+    tBar     := bar_index
+    tStage   := 0
+    tBE      := false
+    tTrail   := na
+    tBanked  := 0.0
+    nTrades     += 1
+    tradesToday += 1
+    if dir == 1
+        lastLongBar := bar_index
+        lastLongPx  := close
+    else
+        lastShortBar := bar_index
+        lastShortPx  := close
+    tStatus  := "RUNNING"
+    tSigTime := str.format_time(time, "dd MMM HH:mm", tzIn)
+    // Only two lines: SL (red) + TP (blue); they stop at the candle that touches one.
+    lSl := line.new(bar_index, tSL, bar_index, tSL, color = colSL, width = 2)
+    lTp := line.new(bar_index, tTP, bar_index, tTP, color = colTP, width = 2)
+    array.push(tradeLines, lSl)
+    array.push(tradeLines, lTp)
+    tip = (dir == 1 ? "BUY · " : "SELL · ") + tSetup + " · " + tSigTime + "\nEntry: " + fmt(tEntry) +
+         "\nSL: " + fmt(tSL) + "\nTP: " + fmt(tTP) + " (" + str.tostring(tpr, "#.##") + "R)"
+    lb = dir == 1 ?
+         label.new(bar_index, low, "BUY", yloc = yloc.belowbar, style = label.style_label_up,
+             color = color.new(color.green, 10), textcolor = color.white, size = size.small, tooltip = tip) :
+         label.new(bar_index, high, "SELL", yloc = yloc.abovebar, style = label.style_label_down,
+             color = color.new(color.red, 10), textcolor = color.white, size = size.small, tooltip = tip)
+    array.push(sigLabels, lb)
+    if alertsOn
+        alert("APEX Q6 " + (dir == 1 ? "BUY" : "SELL") + " · " + tSetup + " · " + syminfo.ticker + " (" + timeframe.period + ")" +
+             "\nEntry: " + fmt(tEntry) + "\nSL: " + fmt(tSL) + "\nTP: " + fmt(tTP) +
+             " (" + str.tostring(tpr, "#.##") + "R)", alert.freq_once_per_bar_close)
+
+while array.size(sigLabels) > keepTrades
+    label.delete(array.shift(sigLabels))
+while array.size(tradeLines) > keepTrades * 3
+    line.delete(array.shift(tradeLines))
+
+// ─────────────────────── PLOTS ───────────────────────
+plot(tDir != 0 and tStage == 1 ? tTrail : na, "Trailing stop", color = colSL, style = plot.style_linebr, linewidth = 2)
+plot(showBands ? ema21 : na, "EMA 21", color = color.new(color.orange, 20))
+plot(showBands ? bbUp  : na, "BB upper", color = color.new(color.gray, 40))
+plot(showBands ? bbMid : na, "BB mid",   color = color.new(color.gray, 60))
+plot(showBands ? bbLo  : na, "BB lower", color = color.new(color.gray, 40))
+plot(tDir != 0 ? tEntry : na, "Entry", color = color.gray, display = display.data_window)
+plot(tDir != 0 ? tSL    : na, "SL",    color = colSL,      display = display.data_window)
+plot(tDir != 0 ? tTP    : na, "TP",    color = colTP,      display = display.data_window)
+bgcolor(showRegime ? (regime == 1 ? color.new(color.green, 94) : regime == 2 ? color.new(color.blue, 94) : color.new(color.gray, 92)) : na,
+     title = "Regime")
+
+// ─────────────────────────── TABLES ───────────────────────────
+colBg  = color.rgb(18, 20, 26)
+colHdr = color.rgb(35, 38, 48)
+
+var table tt = table.new(position.top_right, 2, 9, bgcolor = colBg,
+     frame_width = 1, frame_color = color.new(color.gray, 40),
+     border_width = 1, border_color = color.new(color.gray, 70))
+if showTrade and barstate.islast
+    hdrBg  = tDir == 1 ? color.rgb(0, 110, 50) : tDir == -1 ? color.rgb(150, 25, 25) : colHdr
+    hdrTxt = tDir == 1 ? "BUY ●" : tDir == -1 ? "SELL ●" :
+         lastDir == 1 ? "LAST BUY" : lastDir == -1 ? "LAST SELL" : "WAIT"
+    hasData = nTrades > 0
+    valCol  = tDir != 0 ? color.white : color.new(color.white, 40)
+    regTxt  = regime == 1 ? (upBias ? "TREND ↑" : dnBias ? "TREND ↓" : "TREND (no bias)") : regime == 2 ? "RANGE" : "STAND ASIDE"
+    table.cell(tt, 0, 0, "APEX Q6", text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+    table.cell(tt, 1, 0, hdrTxt, text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+    table.cell(tt, 0, 1, "Regime", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 1, regTxt, text_color = color.aqua, text_size = size.small)
+    table.cell(tt, 0, 2, isIntra ? "Today" : "Mode", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 2, isIntra ? str.tostring(tradesToday) + " / " + str.tostring(maxDay) : "Swing / Invest", text_color = color.aqua, text_size = size.small)
+    table.cell(tt, 0, 3, "Setup", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 3, hasData ? tSetup + " · " + tSigTime : "—", text_color = valCol, text_size = size.small)
+    table.cell(tt, 0, 4, "Entry", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 4, hasData ? fmt(tEntry) : "—", text_color = valCol, text_size = size.small)
+    table.cell(tt, 0, 5, "SL", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 5, hasData ? fmt(tSL) : "—", text_color = color.rgb(255, 90, 90), text_size = size.small)
+    table.cell(tt, 0, 6, "TP", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 6, hasData ? fmt(tTP) + " (" + str.tostring(tTPR, "#.##") + "R)" : "—", text_color = color.rgb(90, 150, 255), text_size = size.small)
+    table.cell(tt, 0, 7, "Status", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 7, hasData ? tStatus : "—", text_color = color.yellow, text_size = size.small)
+    table.cell(tt, 0, 8, "HTF", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 8, htfTF + (htfUp and not htfDn ? " ↑" : htfDn and not htfUp ? " ↓" : ""), text_color = color.silver, text_size = size.small)
+
+var table st = table.new(position.bottom_right, 2, 11, bgcolor = colBg,
+     frame_width = 1, frame_color = color.new(color.gray, 40),
+     border_width = 1, border_color = color.new(color.gray, 70))
+if showStats and barstate.islast
+    decided = nWins + nLoss
+    wr   = decided > 0 ? 100.0 * nWins / decided : 0.0
+    beWR = 100.0 / (1.0 + tpTrend)
+    pf   = grossL > 0 ? grossW / grossL : na
+    expc = nClosed > 0 ? netR / nClosed : na
+    freqTxt = isIntra ? str.tostring(1.0 * nTrades / math.max(dayCount, 1), "#.#") + " / day" :
+         str.tostring(100.0 * nTrades / math.max(bar_index + 1, 1), "#.#") + " / 100 bars"
+    hdrCol = color.rgb(25, 60, 130)
+    table.cell(st, 0, 0, "STATS (net of cost)", text_color = color.white, bgcolor = hdrCol, text_size = size.tiny)
+    table.cell(st, 1, 0, htfTF + " / " + timeframe.period + " · " + (isIntra ? "Intra" : "Swing") + " · " + freqIn, text_color = color.white, bgcolor = hdrCol, text_size = size.tiny)
+    table.cell(st, 0, 1, "Trades (closed)", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 1, str.tostring(nTrades) + " (" + str.tostring(nClosed) + ")", text_color = color.white, text_size = size.tiny)
+    table.cell(st, 0, 2, "Frequency", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 2, freqTxt, text_color = color.white, text_size = size.tiny)
+    table.cell(st, 0, 3, "Win / Loss / BE", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 3, str.tostring(nWins) + " / " + str.tostring(nLoss) + " / " + str.tostring(nBE), text_color = color.white, text_size = size.tiny)
+    table.cell(st, 0, 4, "Win %  (break-even " + str.tostring(beWR, "#") + "%)", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 4, str.tostring(wr, "#.#") + "%", text_color = wr > beWR ? color.rgb(70, 220, 90) : color.orange, text_size = size.tiny)
+    table.cell(st, 0, 5, "Profit factor", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 5, na(pf) ? "—" : str.tostring(pf, "#.##"), text_color = nz(pf) >= 1.3 ? color.rgb(70, 220, 90) : color.orange, text_size = size.tiny)
+    table.cell(st, 0, 6, "Expectancy / trade", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 6, na(expc) ? "—" : str.tostring(expc, "#.##") + " R", text_color = nz(expc) > 0 ? color.rgb(70, 220, 90) : color.rgb(255, 90, 90), text_size = size.tiny)
+    table.cell(st, 0, 7, "Net R", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 7, str.tostring(netR, "#.##") + " R", text_color = netR >= 0 ? color.rgb(70, 220, 90) : color.rgb(255, 90, 90), text_size = size.tiny)
+    table.cell(st, 0, 8, "Max DD / max losing run", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 8, str.tostring(maxDD, "#.##") + " R / " + str.tostring(maxConsec), text_color = color.white, text_size = size.tiny)
+    table.cell(st, 0, 9, "Exits SL / TP / BE", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 9, pc(cSL, nClosed) + " / " + pc(cTP, nClosed) + " / " + pc(cBEx, nClosed), text_color = color.white, text_size = size.tiny)
+    table.cell(st, 0, 10, "Exits Trail / Time", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 10, pc(cTrail, nClosed) + " / " + pc(cTime, nClosed), text_color = color.white, text_size = size.tiny)
+
+alertcondition(goLong,  "APEX Q6 BUY",  "APEX Q6 BUY {{ticker}} ({{interval}}) @ {{close}}")
+alertcondition(goShort, "APEX Q6 SELL", "APEX Q6 SELL {{ticker}} ({{interval}}) @ {{close}}")
+// ═══ END OF APEX QUANT v6 ═══

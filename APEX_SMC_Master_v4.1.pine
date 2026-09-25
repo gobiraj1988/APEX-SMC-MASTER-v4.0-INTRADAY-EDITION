@@ -15,6 +15,11 @@
 // ║   • alert() on BUY / SELL / TP / SL → sound + pop-up in TV        ║
 // ║   • CPR / OB box drawings OFF by default (no chart noise)         ║
 // ║   • 1h added: 1m/3m→15m | 5m→60m | 15m→240m | 1h→240m             ║
+// ╠══════════════════════════════════════════════════════════════════╣
+// ║  COPY THE WHOLE FILE. The last line must be:                      ║
+// ║  // ═══ END OF APEX SMC v4.1 ═══                                   ║
+// ║  If it is missing in the Pine Editor, the paste was cut off       ║
+// ║  (error CE10246 "must contain at least one plot...").             ║
 // ╚══════════════════════════════════════════════════════════════════╝
 indicator("APEX SMC Master v4.1", "APEX SMC", overlay = true,
      max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
@@ -524,6 +529,11 @@ if goLong or goShort
              "\nEntry: " + fmt(tEntry) + "\nSL: " + fmt(tSL) + "\nTP: " + fmt(tTP) +
              " (" + str.tostring(tpRR) + "R)", alert.freq_once_per_bar_close)
 
+// Current trade levels in the Data Window only (nothing drawn on the chart)
+plot(tDir != 0 ? tEntry : na, "Entry", color = color.gray, display = display.data_window)
+plot(tDir != 0 ? tSL    : na, "SL",    color = colSL,      display = display.data_window)
+plot(tDir != 0 ? tTP    : na, "TP",    color = colTP,      display = display.data_window)
+
 // Keep chart clean: only the last N trades' drawings
 while array.size(sigLabels) > keepTrades
     label.delete(array.shift(sigLabels))
@@ -737,3 +747,4 @@ if showStats and barstate.islast
 // Fallback per-signal alert conditions (prefer "Any alert() function call" — it includes Entry/SL/TP)
 alertcondition(goLong,  "APEX SMC BUY",  "APEX SMC BUY {{ticker}} ({{interval}}) @ {{close}}")
 alertcondition(goShort, "APEX SMC SELL", "APEX SMC SELL {{ticker}} ({{interval}}) @ {{close}}")
+// ═══ END OF APEX SMC v4.1 ═══

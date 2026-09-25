@@ -27,3 +27,15 @@ TradingView keeps the scale of an instance that is already on the chart, so afte
 1. Remove **every** APEX SMC instance from the chart (including the old v4.0).
 2. Add it again from Indicators → My scripts.
 3. If labels are still off: indicator name → ⋯ → **Pin to scale → Pin to right scale**.
+
+---
+
+# APEX Quant v5 (new, not SMC) — `APEX_Quant_v5.pine`
+Trend-pullback + breakout system for intraday (1m–1h, e.g. XAUUSD) and swing / investment (4h, D, W, e.g. CSE Sri Lanka stocks).
+- Regime: EMA 21/55 stack + higher-TF EMA-50 + ADX (+ VWAP side intraday, EMA-200 in swing).
+- Entry A: pullback to EMA-21 then a momentum candle closing above/below the previous candle.
+- Entry B: 20-bar breakout with volume expansion. No-chase filter.
+- One SL (red) + one TP (blue); lines stop at the touching candle. Time-stop. Up to 10 trades/day intraday.
+- Swing / Invest mode is long-only by default.
+- Stats: win %, the break-even win % for the chosen TP, profit factor, net R.
+After adding: indicator ⋯ → Pin to scale → Pin to right scale.

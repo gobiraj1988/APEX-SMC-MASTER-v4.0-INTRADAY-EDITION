@@ -1,0 +1,348 @@
+//@version=6
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  APEX QUANT v5 — Trend-Pullback + Breakout (Intraday & Swing)     ║
+// ║  Not SMC. Classic, well-studied edges combined with filters:      ║
+// ║   1. Trend regime  : EMA 21/55 stack + higher-TF EMA-50 + ADX     ║
+// ║   2. Entry A       : pullback to EMA-21, then momentum candle     ║
+// ║                      closes above previous high (continuation)    ║
+// ║   3. Entry B       : 20-bar breakout with volume expansion        ║
+// ║   4. No chasing    : skip if price is > X ATR away from EMA-21    ║
+// ║   5. Risk          : SL beyond recent swing, ATR floor/ceiling,   ║
+// ║                      ONE take-profit (R multiple), time-stop      ║
+// ║  Modes (Auto): ≤1h = INTRADAY (VWAP side, both directions)        ║
+// ║                4h / D / W = SWING / INVEST (EMA-200, long-only)   ║
+// ║  Non-repainting: signals on bar close, HTF uses confirmed bars.   ║
+// ║  Research tool — no indicator is 100% accurate. Judge it by the   ║
+// ║  stats table over 100+ trades, after spread / commission.         ║
+// ╠══════════════════════════════════════════════════════════════════╣
+// ║  COPY THE WHOLE FILE. The last line must be:                      ║
+// ║  // ═══ END OF APEX QUANT v5 ═══                                   ║
+// ╚══════════════════════════════════════════════════════════════════╝
+indicator("APEX Quant v5", "APEX Q5", overlay = true, scale = scale.right,
+     max_lines_count = 500, max_labels_count = 500)
+
+// ───────────────────────────── INPUTS ─────────────────────────────
+grpM     = "⚡ Mode"
+modeIn   = input.string("Auto", "Mode", options = ["Auto", "Intraday", "Swing / Invest"], group = grpM,
+     tooltip = "Auto: 1m–1h = Intraday, 4h / D / W = Swing / Invest.")
+freqIn   = input.string("Normal", "Signal frequency", options = ["Active", "Normal", "Conservative"], group = grpM,
+     tooltip = "Active = more trades (looser ADX / cooldown). Conservative = fewer, stricter trades.")
+dirIn    = input.string("Auto", "Direction", options = ["Auto", "Both", "Long only"], group = grpM,
+     tooltip = "Auto: Intraday = Both, Swing / Invest = Long only (stocks, e.g. CSE Sri Lanka).")
+tzIn     = input.string("GMT+4", "Your timezone (signal time, day reset, session)", group = grpM)
+
+grpE     = "🎯 Entries"
+useBO    = input.bool(true, "Enable breakout entries (20-bar high/low + volume)", group = grpE)
+useVWAP  = input.bool(true, "Intraday: longs above VWAP / shorts below", group = grpE)
+chaseATR = input.float(1.5, "No-chase: max distance from EMA-21 (× ATR)", minval = 0.3, step = 0.1, group = grpE)
+
+grpR     = "🛡 Risk (one SL + one TP)"
+tpIntra  = input.float(1.5, "TP (R) — Intraday", minval = 0.5, maxval = 10, step = 0.1, group = grpR)
+tpSwing  = input.float(2.0, "TP (R) — Swing / Invest", minval = 0.5, maxval = 10, step = 0.1, group = grpR)
+minRiskATR = input.float(1.0, "Min SL distance (× chart ATR)", minval = 0.2, step = 0.1, group = grpR,
+     tooltip = "Prevents stops inside normal noise (the 'always stopped on 1m' problem).")
+minRiskHtf = input.float(0.35, "Min SL distance (× higher-TF ATR), 0 = off", minval = 0, step = 0.05, group = grpR)
+maxRiskATR = input.float(3.0, "Skip if SL wider than (× chart ATR)", minval = 0.5, step = 0.1, group = grpR)
+iMaxHold   = input.int(0, "Time-stop (bars, 0 = auto)", minval = 0, group = grpR,
+     tooltip = "Auto: 1m=90, 5m=48, 15m=32, 1h=24, swing=60 bars. Closes the trade at market.")
+
+grpS     = "🕒 Session & limits (intraday)"
+useSess  = input.bool(false, "Trade only inside session", group = grpS)
+sessIn   = input.session("1000-0100", "Session (your timezone)", group = grpS)
+maxDay   = input.int(10, "Max trades per day (intraday)", minval = 1, maxval = 50, group = grpS)
+
+grpAL      = "🔔 Alerts (sound + pop-up)"
+alertsOn   = input.bool(true, "Send BUY / SELL alerts", group = grpAL,
+     tooltip = "Create ONE alert: Condition = APEX Q5 → 'Any alert() function call', tick Show pop-up + Play sound. Untick here or pause the alert to silence.")
+alertExits = input.bool(true, "Also alert when TP / SL / time-stop hit", group = grpAL)
+
+grpUI      = "Display"
+keepTrades = input.int(20, "Keep last N trades on chart", minval = 1, maxval = 100, group = grpUI)
+showEMAs   = input.bool(false, "Show EMA 21 / 55 (and 200 in swing)", group = grpUI)
+showVWAP   = input.bool(false, "Show VWAP (intraday)", group = grpUI)
+showTrade  = input.bool(true, "Show trade table", group = grpUI)
+showStats  = input.bool(true, "Show backtest stats table", group = grpUI)
+
+// ─────────────────────── MODE / PARAMETERS ───────────────────────
+tfSec   = timeframe.in_seconds()
+isIntra = modeIn == "Intraday" or (modeIn == "Auto" and tfSec <= 3600)
+longOnly = dirIn == "Long only" or (dirIn == "Auto" and not isIntra)
+isAct   = freqIn == "Active"
+isCons  = freqIn == "Conservative"
+
+adxMin   = isAct ? 15.0 : isCons ? 25.0 : 20.0
+cooldown = isAct ? 3 : isCons ? 8 : 5
+pbWin    = isAct ? 6 : isCons ? 4 : 5
+volMult  = isAct ? 1.2 : isCons ? 1.6 : 1.4
+tpRR     = isIntra ? tpIntra : tpSwing
+maxHold  = iMaxHold > 0 ? iMaxHold : not isIntra ? 60 :
+     tfSec <= 60 ? 90 : tfSec <= 300 ? 48 : tfSec <= 900 ? 32 : 24
+
+// Higher timeframe: 1m/3m→15m | 5m→60m | 15m/30m→60m/240m | 1h→4h | 4h→D | D→W | W→M
+autoHTF() =>
+    p = timeframe.period
+    p == "1" ? "15" : p == "3" ? "15" : p == "5" ? "60" : p == "15" ? "60" : p == "30" ? "240" :
+     p == "60" ? "240" : p == "240" ? "D" : p == "1D" or p == "D" ? "W" : p == "1W" or p == "W" ? "M" : "D"
+htfTF = autoHTF()
+
+// Confirmed HTF bar only ([1] + lookahead_on) → no repainting
+f_htf() =>
+    e = ta.ema(close, 50)
+    a = ta.atr(14)
+    [close[1], e[1], a[1]]
+[hC, hE, hA] = request.security(syminfo.tickerid, htfTF, f_htf(), lookahead = barmerge.lookahead_on)
+htfUp = na(hE) or hC > hE
+htfDn = na(hE) or hC < hE
+
+// ─────────────────────── CORE SERIES (computed every bar) ───────────────────────
+ema9   = ta.ema(close, 9)
+ema21  = ta.ema(close, 21)
+ema55  = ta.ema(close, 55)
+ema200 = ta.ema(close, 200)
+atr14  = ta.atr(14)
+rsi14  = ta.rsi(close, 14)
+[diP, diM, adxV] = ta.dmi(14, 14)
+vwapV  = ta.vwap(hlc3)
+volAvg = ta.sma(volume, 20)
+hh20   = ta.highest(high, 20)
+ll20   = ta.lowest(low, 20)
+lowPB  = ta.lowest(low, pbWin)
+highPB = ta.highest(high, pbWin)
+swLo   = ta.lowest(low, 5)
+swHi   = ta.highest(high, 5)
+
+hasVol = not na(volAvg) and volAvg > 0
+volOK  = not hasVol or volume >= volMult * volAvg
+
+// ─────────────────────── REGIME ───────────────────────
+trendUp = ema21 > ema55 and close > ema55 and htfUp and adxV >= adxMin and diP > diM
+trendDn = ema21 < ema55 and close < ema55 and htfDn and adxV >= adxMin and diM > diP
+if not isIntra
+    trendUp := trendUp and close > ema200
+    trendDn := trendDn and close < ema200
+if isIntra and useVWAP and not na(vwapV)
+    trendUp := trendUp and close > vwapV
+    trendDn := trendDn and close < vwapV
+
+// ─────────────────────── TRIGGERS ───────────────────────
+pbLong   = lowPB  <= ema21 + 0.2 * atr14
+pbShort  = highPB >= ema21 - 0.2 * atr14
+trigPBL  = pbLong  and close > open and close > high[1] and close > ema9 and rsi14 > 50
+trigPBS  = pbShort and close < open and close < low[1]  and close < ema9 and rsi14 < 50
+trigBOL  = useBO and close > hh20[1] and close > open and volOK
+trigBOS  = useBO and close < ll20[1] and close < open and volOK
+noChaseL = close - ema21 <= chaseATR * atr14
+noChaseS = ema21 - close <= chaseATR * atr14
+
+// ─────────────────────── SESSION / DAY LIMIT ───────────────────────
+inSess  = not na(time(timeframe.period, sessIn, tzIn))
+sessOK  = not isIntra or not useSess or inSess
+dayKey  = dayofmonth(time, tzIn)
+newDay  = dayKey != dayKey[1]
+var int tradesToday = 0
+if newDay
+    tradesToday := 0
+dayOK = not isIntra or tradesToday < maxDay
+
+// ─────────────────────── TRADE STATE ───────────────────────
+var int    tDir     = 0
+var int    lastDir  = 0
+var float  tEntry   = na
+var float  tSL      = na
+var float  tTP      = na
+var float  tRisk    = na
+var int    tBar     = na
+var int    lastExitBar = na
+var string tStatus  = "—"
+var string tSigTime = "—"
+
+var int   nTrades = 0
+var int   nWins   = 0
+var int   nLoss   = 0
+var int   cTP     = 0
+var int   cSL     = 0
+var int   cTime   = 0
+var float netR    = 0.0
+var float grossW  = 0.0
+var float grossL  = 0.0
+
+var line lSl = na
+var line lTp = na
+var tradeLines = array.new<line>()
+var sigLabels  = array.new<label>()
+
+colSL = color.new(color.red, 0)
+colTP = color.new(color.blue, 0)
+
+fmt(float v) =>
+    na(v) ? "—" : str.tostring(v, format.mintick)
+
+// ─────────────────── TRADE MANAGEMENT (before new entries) ───────────────────
+// From the bar after entry. SL and TP in the same candle → SL assumed (conservative).
+float  exitR   = na
+string exitTxt = ""
+if tDir != 0 and bar_index > tBar
+    if tDir == 1
+        if low <= tSL
+            exitR   := -1.0
+            exitTxt := "SL"
+        else if high >= tTP
+            exitR   := tpRR
+            exitTxt := "TP"
+    else
+        if high >= tSL
+            exitR   := -1.0
+            exitTxt := "SL"
+        else if low <= tTP
+            exitR   := tpRR
+            exitTxt := "TP"
+    if na(exitR) and bar_index - tBar >= maxHold
+        exitR   := tDir == 1 ? (close - tEntry) / tRisk : (tEntry - close) / tRisk
+        exitTxt := "TIME"
+
+if not na(exitR)
+    line.set_x2(lSl, bar_index)
+    line.set_x2(lTp, bar_index)
+    netR += exitR
+    if exitR > 0
+        nWins  += 1
+        grossW += exitR
+    else
+        nLoss  += 1
+        grossL += -exitR
+    if exitTxt == "TP"
+        cTP += 1
+    if exitTxt == "SL"
+        cSL += 1
+    if exitTxt == "TIME"
+        cTime += 1
+    tStatus := exitTxt == "TP" ? "TP HIT ✓" : exitTxt == "SL" ? "SL HIT ✗" :
+         "TIME EXIT (" + str.tostring(exitR, "#.##") + "R)"
+    if alertsOn and alertExits
+        alert("APEX Q5 " + syminfo.ticker + " (" + timeframe.period + ") " + (tDir == 1 ? "BUY" : "SELL") +
+             " closed: " + tStatus, alert.freq_once_per_bar_close)
+    tDir := 0
+    lastExitBar := bar_index
+else if tDir != 0
+    line.set_x2(lSl, bar_index)
+    line.set_x2(lTp, bar_index)
+
+// ─────────────────────── ENTRY ───────────────────────
+coolOK = na(lastExitBar) or bar_index - lastExitBar >= cooldown
+baseOK = tDir == 0 and coolOK and sessOK and dayOK and barstate.isconfirmed and not na(atr14) and not na(adxV)
+
+minRisk = math.max(minRiskATR * atr14, minRiskHtf * nz(hA, 0.0))
+maxRisk = math.max(maxRiskATR * atr14, 2.0 * minRisk)
+longSL  = math.min(swLo - 0.2 * atr14, close - minRisk)
+shortSL = math.max(swHi + 0.2 * atr14, close + minRisk)
+longRk  = close - longSL
+shortRk = shortSL - close
+
+goLong  = baseOK and trendUp and (trigPBL or trigBOL) and noChaseL and longRk > 0 and longRk <= maxRisk
+goShort = baseOK and not longOnly and trendDn and (trigPBS or trigBOS) and noChaseS and shortRk > 0 and shortRk <= maxRisk and not goLong
+
+if goLong or goShort
+    dir = goLong ? 1 : -1
+    sl  = goLong ? longSL : shortSL
+    rk  = goLong ? longRk : shortRk
+    why = goLong ? (trigPBL ? "Pullback" : "Breakout") : (trigPBS ? "Pullback" : "Breakout")
+    tDir     := dir
+    lastDir  := dir
+    tEntry   := close
+    tSL      := sl
+    tRisk    := rk
+    tTP      := dir == 1 ? close + tpRR * rk : close - tpRR * rk
+    tBar     := bar_index
+    nTrades     += 1
+    tradesToday += 1
+    tStatus  := "RUNNING (" + why + ")"
+    tSigTime := str.format_time(time, "dd MMM HH:mm", tzIn)
+    // Only two lines: SL (red) + TP (blue); they stop at the candle that touches one.
+    lSl := line.new(bar_index, tSL, bar_index, tSL, color = colSL, width = 2)
+    lTp := line.new(bar_index, tTP, bar_index, tTP, color = colTP, width = 2)
+    array.push(tradeLines, lSl)
+    array.push(tradeLines, lTp)
+    tip = (dir == 1 ? "BUY " : "SELL ") + why + " " + tSigTime + "\nEntry: " + fmt(tEntry) + "\nSL: " + fmt(tSL) + "\nTP: " + fmt(tTP)
+    lb = dir == 1 ?
+         label.new(bar_index, low, "BUY", yloc = yloc.belowbar, style = label.style_label_up,
+             color = color.new(color.green, 10), textcolor = color.white, size = size.small, tooltip = tip) :
+         label.new(bar_index, high, "SELL", yloc = yloc.abovebar, style = label.style_label_down,
+             color = color.new(color.red, 10), textcolor = color.white, size = size.small, tooltip = tip)
+    array.push(sigLabels, lb)
+    if alertsOn
+        alert("APEX Q5 " + (dir == 1 ? "BUY" : "SELL") + " (" + why + ") " + syminfo.ticker + " (" + timeframe.period + ")" +
+             "\nEntry: " + fmt(tEntry) + "\nSL: " + fmt(tSL) + "\nTP: " + fmt(tTP) +
+             " (" + str.tostring(tpRR) + "R)", alert.freq_once_per_bar_close)
+
+while array.size(sigLabels) > keepTrades
+    label.delete(array.shift(sigLabels))
+while array.size(tradeLines) > keepTrades * 2
+    line.delete(array.shift(tradeLines))
+
+// ─────────────────────── PLOTS ───────────────────────
+plot(showEMAs ? ema21 : na, "EMA 21", color = color.new(color.orange, 20))
+plot(showEMAs ? ema55 : na, "EMA 55", color = color.new(color.purple, 20))
+plot(showEMAs and not isIntra ? ema200 : na, "EMA 200", color = color.new(color.gray, 10), linewidth = 2)
+plot(showVWAP and isIntra ? vwapV : na, "VWAP", color = color.new(color.teal, 20))
+plot(tDir != 0 ? tEntry : na, "Entry", color = color.gray, display = display.data_window)
+plot(tDir != 0 ? tSL    : na, "SL",    color = colSL,      display = display.data_window)
+plot(tDir != 0 ? tTP    : na, "TP",    color = colTP,      display = display.data_window)
+
+// ─────────────────────────── TABLES ───────────────────────────
+colBg  = color.rgb(18, 20, 26)
+colHdr = color.rgb(35, 38, 48)
+
+var table tt = table.new(position.top_right, 2, 7, bgcolor = colBg,
+     frame_width = 1, frame_color = color.new(color.gray, 40),
+     border_width = 1, border_color = color.new(color.gray, 70))
+if showTrade and barstate.islast
+    hdrBg  = tDir == 1 ? color.rgb(0, 110, 50) : tDir == -1 ? color.rgb(150, 25, 25) : colHdr
+    hdrTxt = tDir == 1 ? "BUY ●" : tDir == -1 ? "SELL ●" :
+         lastDir == 1 ? "LAST BUY" : lastDir == -1 ? "LAST SELL" : "WAIT"
+    hasData = nTrades > 0
+    valCol  = tDir != 0 ? color.white : color.new(color.white, 40)
+    table.cell(tt, 0, 0, "APEX Q5", text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+    table.cell(tt, 1, 0, hdrTxt, text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+    table.cell(tt, 0, 1, isIntra ? "Today" : "Mode", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 1, isIntra ? str.tostring(tradesToday) + " / " + str.tostring(maxDay) : "Swing / Invest", text_color = color.aqua, text_size = size.small)
+    table.cell(tt, 0, 2, "Time", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 2, hasData ? tSigTime : "—", text_color = valCol, text_size = size.small)
+    table.cell(tt, 0, 3, "Entry", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 3, hasData ? fmt(tEntry) : "—", text_color = valCol, text_size = size.small)
+    table.cell(tt, 0, 4, "SL", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 4, hasData ? fmt(tSL) : "—", text_color = color.rgb(255, 90, 90), text_size = size.small)
+    table.cell(tt, 0, 5, "TP (" + str.tostring(tpRR) + "R)", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 5, hasData ? fmt(tTP) : "—", text_color = color.rgb(90, 150, 255), text_size = size.small)
+    table.cell(tt, 0, 6, "Status", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 6, hasData ? tStatus : "—", text_color = color.yellow, text_size = size.small)
+
+var table st = table.new(position.bottom_right, 2, 9, bgcolor = colBg,
+     frame_width = 1, frame_color = color.new(color.gray, 40),
+     border_width = 1, border_color = color.new(color.gray, 70))
+if showStats and barstate.islast
+    closed = nWins + nLoss
+    wr = closed > 0 ? 100.0 * nWins / closed : 0.0
+    pf = grossL > 0 ? grossW / grossL : na
+    beWR = 100.0 / (1.0 + tpRR)
+    table.cell(st, 0, 0, "BACKTEST (approx)", text_color = color.white, bgcolor = color.rgb(25, 60, 130), text_size = size.tiny)
+    table.cell(st, 1, 0, htfTF + " / " + timeframe.period, text_color = color.white, bgcolor = color.rgb(25, 60, 130), text_size = size.tiny)
+    table.cell(st, 0, 1, "Mode", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 1, (isIntra ? "Intraday" : "Swing") + " · " + freqIn, text_color = color.aqua, text_size = size.tiny)
+    table.cell(st, 0, 2, "Trades", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 2, str.tostring(nTrades), text_color = color.white, text_size = size.tiny)
+    table.cell(st, 0, 3, "Win / Loss", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 3, str.tostring(nWins) + " / " + str.tostring(nLoss), text_color = color.white, text_size = size.tiny)
+    table.cell(st, 0, 4, "Win %  (need > " + str.tostring(beWR, "#") + "%)", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 4, str.tostring(wr, "#.#") + "%", text_color = wr > beWR ? color.rgb(70, 220, 90) : color.orange, text_size = size.tiny)
+    table.cell(st, 0, 5, "TP / SL / Time", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 5, str.tostring(cTP) + " / " + str.tostring(cSL) + " / " + str.tostring(cTime), text_color = color.white, text_size = size.tiny)
+    table.cell(st, 0, 6, "Profit factor", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 6, na(pf) ? "—" : str.tostring(pf, "#.##"), text_color = nz(pf) >= 1.3 ? color.rgb(70, 220, 90) : color.orange, text_size = size.tiny)
+    table.cell(st, 0, 7, "Net R", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 7, str.tostring(netR, "#.##") + " R", text_color = netR >= 0 ? color.rgb(70, 220, 90) : color.rgb(255, 90, 90), text_size = size.tiny)
+    table.cell(st, 0, 8, "Avg R / trade", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 8, closed > 0 ? str.tostring(netR / closed, "#.##") + " R" : "—", text_color = color.white, text_size = size.tiny)
+
+alertcondition(goLong,  "APEX Q5 BUY",  "APEX Q5 BUY {{ticker}} ({{interval}}) @ {{close}}")
+alertcondition(goShort, "APEX Q5 SELL", "APEX Q5 SELL {{ticker}} ({{interval}}) @ {{close}}")
+// ═══ END OF APEX QUANT v5 ═══

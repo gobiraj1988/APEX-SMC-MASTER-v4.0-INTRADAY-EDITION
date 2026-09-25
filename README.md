@@ -14,8 +14,13 @@ The alert message contains symbol, TF, Entry, SL and TP. Exit alerts (TP / SL / 
 - Non-repainting HTF (confirmed HTF bar only) — live signals match the backtest.
 - CHoCH must close beyond structure with a displacement candle (body ≥ 0.6 ATR).
 - HTF EMA-50 trend must agree with HTF structure bias.
-- SL at the sweep extreme + buffer, clamped to 0.5–2.0 ATR (wider = skipped).
+- SL at the sweep extreme + buffer, at least max(1 × chart ATR, 0.5 × HTF ATR) away; skipped if wider than max(3 × ATR, 2 × min SL).
 - One TP (default 1.5R). Only 2 lines per trade (SL red, TP blue) — they stop at the candle that touches either.
 - Time-stop per TF so no trade runs for days; session filter 10:00–22:00 GMT+4 on by default.
 - Chart keeps only the last N trades; CPR / OB box drawings off by default.
 - HTF pairing: 1m/3m→15m, 5m→60m, 15m→240m, 1h→240m.
+
+## Drawings not sitting on the candles?
+The script pins itself to the price scale (`scale = scale.right`). If an older copy was added before this fix,
+remove it from the chart and add it again, or: indicator name → ⋯ → **Pin to scale → Pin to right scale**.
+Also remove the old v4.0 indicator from the chart.

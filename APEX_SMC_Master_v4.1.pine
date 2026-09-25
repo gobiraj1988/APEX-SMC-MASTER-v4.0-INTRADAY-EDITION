@@ -6,7 +6,7 @@
 // ║   • NON-REPAINTING HTF (confirmed HTF bar only) → backtest = live ║
 // ║   • Entry CHoCH must CLOSE beyond + displacement candle (ATR)     ║
 // ║   • HTF EMA-50 trend must agree with HTF structure bias           ║
-// ║   • SL at the sweep extreme, risk clamped to 0.5–2.0 ATR          ║
+// ║   • SL at the sweep extreme, floored by HTF ATR (no noise stops)  ║
 // ║   • ONE take-profit (default 1.5R) — small, realistic target      ║
 // ║   • Only 2 lines per trade: SL (red) + TP (blue); they stop at    ║
 // ║     the candle that touches either one. No lines left running.   ║
@@ -15,13 +15,15 @@
 // ║   • alert() on BUY / SELL / TP / SL → sound + pop-up in TV        ║
 // ║   • CPR / OB box drawings OFF by default (no chart noise)         ║
 // ║   • 1h added: 1m/3m→15m | 5m→60m | 15m→240m | 1h→240m             ║
+// ║   • Pinned to the price scale → drawings stay on the candles      ║
+// ║     when you zoom / scroll                                        ║
 // ╠══════════════════════════════════════════════════════════════════╣
 // ║  COPY THE WHOLE FILE. The last line must be:                      ║
 // ║  // ═══ END OF APEX SMC v4.1 ═══                                   ║
 // ║  If it is missing in the Pine Editor, the paste was cut off       ║
 // ║  (error CE10246 "must contain at least one plot...").             ║
 // ╚══════════════════════════════════════════════════════════════════╝
-indicator("APEX SMC Master v4.1", "APEX SMC", overlay = true,
+indicator("APEX SMC Master v4.1", "APEX SMC", overlay = true, scale = scale.right,
      max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
 
 // ───────────────────────────── PRESET ─────────────────────────────
@@ -41,10 +43,12 @@ tzIn    = input.string("GMT+4", "Your timezone (signal time, day reset, session)
 grpTR      = "🎯 Trade (one SL + one TP)"
 tpRR       = input.float(1.5, "Take-profit (R multiple)", minval = 0.5, maxval = 10, step = 0.1, group = grpTR,
      tooltip = "Small, realistic target. 1.5 = TP is 1.5 × the stop-loss distance.")
-minRiskATR = input.float(0.5, "Min SL distance (× ATR)", minval = 0.1, step = 0.1, group = grpTR,
+minRiskATR = input.float(1.0, "Min SL distance (× chart ATR)", minval = 0.1, step = 0.1, group = grpTR,
      tooltip = "Stops tighter than this are widened — avoids being stopped by noise/spread.")
-maxRiskATR = input.float(2.0, "Max SL distance (× ATR) — skip if wider", minval = 0.5, step = 0.1, group = grpTR,
-     tooltip = "If the structural stop is further away than this, the signal is skipped (bad location).")
+minRiskHtf = input.float(0.5, "Min SL distance (× HTF ATR)", minval = 0, step = 0.05, group = grpTR,
+     tooltip = "Floor from the higher timeframe. Gold approx: 1m ≈ 3–5, 5m ≈ 6–8, 15m/1h ≈ 12–18 USD. 0 = off.")
+maxRiskATR = input.float(3.0, "Max SL distance (× chart ATR) — skip if wider", minval = 0.5, step = 0.1, group = grpTR,
+     tooltip = "If the structural stop is further away than this (or 2 × the min SL), the signal is skipped.")
 iMaxHold   = input.int(0, "Time-stop (bars, 0 = auto per TF)", minval = 0, group = grpTR,
      tooltip = "Auto: 1m=120, 3m=80, 5m=60, 15m=32, 1h+=24 bars. Trade closes at market after this.")
 useBE      = input.bool(false, "Move SL to break-even", group = grpTR, inline = "be")
@@ -159,6 +163,7 @@ f_htf() =>
     bsFvgDn = ta.barssince(fvgDn)
     emaH  = ta.ema(close, 50)
     trend = close > emaH ? 1 : close < emaH ? -1 : 0
+    atrH  = ta.atr(14)
     var int   bias  = 0
     var float obLo  = na
     var float obHi  = na
@@ -182,9 +187,9 @@ f_htf() =>
         obId  += 1
         obImb := fvgDn or (not na(bsFvgDn) and bsFvgDn <= 3)
     eq = not na(swHigh) and not na(swLow) ? (swHigh + swLow) / 2 : na
-    [bias[1], obLo[1], obHi[1], obDir[1], obId[1], swHigh[1], swLow[1], eq[1], obImb[1], trend[1]]
+    [bias[1], obLo[1], obHi[1], obDir[1], obId[1], swHigh[1], swLow[1], eq[1], obImb[1], trend[1], atrH[1]]
 
-[htfBiasR, htfObLo, htfObHi, htfObDirR, htfObIdR, htfHigh, htfLow, htfEq, htfObImb, htfTrendR] =
+[htfBiasR, htfObLo, htfObHi, htfObDirR, htfObIdR, htfHigh, htfLow, htfEq, htfObImb, htfTrendR, htfAtr] =
      request.security(syminfo.tickerid, htfTF, f_htf(), lookahead = barmerge.lookahead_on)
 htfBias  = nz(htfBiasR)
 htfObDir = nz(htfObDirR)
@@ -472,13 +477,16 @@ shortCore = htfBias == -1 and shortPOIRecent and chochDn and tDir == 0 and htfOb
 goLongRaw  = longCore  and pdLongOK  and seqLongOK  and imbOK and fvgLongOK  and trendLOK and sessOK and dayCapOK and scoreLong  >= needScore and barstate.isconfirmed
 goShortRaw = shortCore and pdShortOK and seqShortOK and imbOK and fvgShortOK and trendSOK and sessOK and dayCapOK and scoreShort >= needScore and barstate.isconfirmed
 
-// Risk model: SL beyond the sweep extreme (+buffer), clamped to [min, max] × ATR
-longSL  = math.min(nz(swpLongExt, low) - slBuffer, close - minRiskATR * atr14)
-shortSL = math.max(nz(swpShortExt, high) + slBuffer, close + minRiskATR * atr14)
+// Risk model: SL beyond the sweep extreme (+buffer), at least minRisk away
+// (chart ATR and HTF ATR floor); skipped if the structural stop is wider than maxRisk
+minRisk = math.max(minRiskATR * atr14, minRiskHtf * nz(htfAtr, 0.0))
+maxRisk = math.max(maxRiskATR * atr14, 2.0 * minRisk)
+longSL  = math.min(nz(swpLongExt, low) - slBuffer, close - minRisk)
+shortSL = math.max(nz(swpShortExt, high) + slBuffer, close + minRisk)
 longRk  = close - longSL
 shortRk = shortSL - close
-longRiskOK  = longRk  > 0 and longRk  <= maxRiskATR * atr14
-shortRiskOK = shortRk > 0 and shortRk <= maxRiskATR * atr14
+longRiskOK  = longRk  > 0 and longRk  <= maxRisk
+shortRiskOK = shortRk > 0 and shortRk <= maxRisk
 // Room gate: opposite HTF liquidity must lie beyond TP (price above old swing = open sky)
 longRoomOK  = not useRRGate or na(htfHigh) or htfHigh <= close or (htfHigh - close) >= tpRR * longRk
 shortRoomOK = not useRRGate or na(htfLow)  or htfLow  >= close or (close - htfLow)  >= tpRR * shortRk

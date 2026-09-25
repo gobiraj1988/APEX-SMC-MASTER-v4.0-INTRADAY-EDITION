@@ -1,0 +1,739 @@
+//@version=6
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  APEX SMC MASTER v4.1 — INTRADAY EDITION (clean + alerts)         ║
+// ║  Base: SMC_M15_M1_LOCKED_RULEBOOK (Iraj, 2026-05-29)             ║
+// ║  v4.1 changes vs v4.0:                                            ║
+// ║   • NON-REPAINTING HTF (confirmed HTF bar only) → backtest = live ║
+// ║   • Entry CHoCH must CLOSE beyond + displacement candle (ATR)     ║
+// ║   • HTF EMA-50 trend must agree with HTF structure bias           ║
+// ║   • SL at the sweep extreme, risk clamped to 0.5–2.0 ATR          ║
+// ║   • ONE take-profit (default 1.5R) — small, realistic target      ║
+// ║   • Only 2 lines per trade: SL (red) + TP (blue); they stop at    ║
+// ║     the candle that touches either one. No lines left running.   ║
+// ║   • Time-stop: intraday trades are closed after N bars            ║
+// ║   • Session filter ON (London + NY, GMT+4)                        ║
+// ║   • alert() on BUY / SELL / TP / SL → sound + pop-up in TV        ║
+// ║   • CPR / OB box drawings OFF by default (no chart noise)         ║
+// ║   • 1h added: 1m/3m→15m | 5m→60m | 15m→240m | 1h→240m             ║
+// ╚══════════════════════════════════════════════════════════════════╝
+indicator("APEX SMC Master v4.1", "APEX SMC", overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// ───────────────────────────── PRESET ─────────────────────────────
+grpP    = "⚡ Preset (overrides SMC / accuracy inputs)"
+preset  = input.string("Accurate (recommended)", "Trading style",
+     options = ["Accurate (recommended)", "Intraday (more signals)", "Strict (fewest)", "Manual (use inputs)"], group = grpP)
+isAcc    = preset == "Accurate (recommended)"
+isMore   = preset == "Intraday (more signals)"
+isStrict = preset == "Strict (fewest)"
+isManual = preset == "Manual (use inputs)"
+
+// ───────────────────────────── INPUTS ─────────────────────────────
+grpTF   = "Timeframes"
+htfMode = input.string("Auto", "HTF (bias + POI)", options = ["Auto", "15", "60", "240", "D"], group = grpTF)
+tzIn    = input.string("GMT+4", "Your timezone (signal time, day reset, session)", group = grpTF)
+
+grpTR      = "🎯 Trade (one SL + one TP)"
+tpRR       = input.float(1.5, "Take-profit (R multiple)", minval = 0.5, maxval = 10, step = 0.1, group = grpTR,
+     tooltip = "Small, realistic target. 1.5 = TP is 1.5 × the stop-loss distance.")
+minRiskATR = input.float(0.5, "Min SL distance (× ATR)", minval = 0.1, step = 0.1, group = grpTR,
+     tooltip = "Stops tighter than this are widened — avoids being stopped by noise/spread.")
+maxRiskATR = input.float(2.0, "Max SL distance (× ATR) — skip if wider", minval = 0.5, step = 0.1, group = grpTR,
+     tooltip = "If the structural stop is further away than this, the signal is skipped (bad location).")
+iMaxHold   = input.int(0, "Time-stop (bars, 0 = auto per TF)", minval = 0, group = grpTR,
+     tooltip = "Auto: 1m=120, 3m=80, 5m=60, 15m=32, 1h+=24 bars. Trade closes at market after this.")
+useBE      = input.bool(false, "Move SL to break-even", group = grpTR, inline = "be")
+beAt       = input.float(1.0, "at R", minval = 0.3, step = 0.1, group = grpTR, inline = "be")
+spreadTicks = input.float(20, "Spread (ticks) for SL buffer", minval = 0, group = grpTR)
+
+grpSMC       = "SMC Core (Manual preset only)"
+iLiqLen      = input.int(4,  "Liquidity-pool pivot length", minval = 2, group = grpSMC)
+iPoiWindow   = input.int(45, "Max bars after POI tap to allow entry", minval = 5, group = grpSMC)
+iSweepWindow = input.int(20, "Max bars after sweep to allow CHoCH", minval = 3, group = grpSMC)
+iUseRRGate   = input.bool(true, "Room gate: HTF liquidity must be ≥ TP distance", group = grpSMC)
+iUsePD       = input.bool(false, "Premium/Discount filter (long<50%, short>50%)", group = grpSMC)
+iUseSeq      = input.bool(true,  "Enforce sequence: POI tap → sweep → CHoCH", group = grpSMC)
+iUseObImb    = input.bool(true,  "HTF OB must have imbalance/FVG", group = grpSMC)
+iUseFVGConf  = input.bool(false, "Require LTF FVG near entry", group = grpSMC)
+iStrictCH    = input.bool(true,  "Strict CHoCH: candle CLOSE beyond (not wick)", group = grpSMC)
+iUseDisp     = input.bool(true,  "Displacement: CHoCH candle body ≥ X × ATR", group = grpSMC)
+iUseHtfTrend = input.bool(true,  "HTF EMA-50 trend must agree", group = grpSMC)
+iMaxPerDay   = input.int(3, "Max trades per day", minval = 1, maxval = 20, group = grpSMC)
+iMinScore    = input.int(2, "Min confluence filters that must agree (0-4)", minval = 0, maxval = 4, group = grpSMC)
+dispMult     = input.float(0.6, "Displacement body (× ATR)", minval = 0.1, step = 0.1, group = grpSMC)
+
+grpSES  = "🕒 Session"
+useSess = input.bool(true, "Trade only inside session", group = grpSES)
+sessIn  = input.session("1000-2200", "Session (in your timezone above)", group = grpSES,
+     tooltip = "Default 10:00-22:00 GMT+4 = London open → New York afternoon (best gold liquidity).")
+
+grpFLT   = "Confluence filters (scored)"
+useRSI   = input.bool(true,  "RSI filter (>50 long / <50 short)", group = grpFLT)
+rsiLen   = input.int(14, "RSI length", minval = 2, group = grpFLT)
+useEMA   = input.bool(true,  "EMA-50 trend filter (chart TF)", group = grpFLT)
+useVol   = input.bool(true,  "Relative-volume filter", group = grpFLT)
+volMult  = input.float(1.2, "Rel-volume threshold", step = 0.1, minval = 0.5, group = grpFLT)
+useCPR   = input.bool(true,  "CPR filter (close vs daily pivot)", group = grpFLT)
+
+grpAL      = "🔔 Alerts (sound + pop-up)"
+alertsOn   = input.bool(true, "Send BUY / SELL alerts", group = grpAL,
+     tooltip = "Create ONE alert: Condition = APEX SMC → 'Any alert() function call'. Tick 'Show pop-up' + 'Play sound'. Untick this box (or pause the alert) to silence it.")
+alertExits = input.bool(true, "Also alert when TP / SL / time-stop hit", group = grpAL)
+
+grpUI     = "Display"
+keepTrades = input.int(15, "Keep last N trades on chart", minval = 1, maxval = 100, group = grpUI)
+showTrade = input.bool(true,  "Show trade table", group = grpUI)
+showStats = input.bool(true,  "Show backtest stats table", group = grpUI)
+showEMA   = input.bool(false, "Plot EMA 50 / 200", group = grpUI)
+
+grpVF      = "✔ VERIFY drawings (all OFF = clean chart)"
+showOB     = input.bool(false, "Order Block (active HTF OB box)", group = grpVF)
+showFVG    = input.bool(false, "FVG / Imbalance boxes (chart TF)", group = grpVF)
+showStruct = input.bool(false, "Structure labels HH / HL / LH / LL", group = grpVF)
+showBOS    = input.bool(false, "BOS / CHoCH structural breaks", group = grpVF)
+showIDM    = input.bool(false, "IDM line", group = grpVF)
+showERL    = input.bool(false, "ERL line", group = grpVF)
+showLiq    = input.bool(false, "Liquidity pools BSL / SSL lines", group = grpVF)
+showSweep  = input.bool(false, "Liquidity-sweep markers", group = grpVF)
+showCHmk   = input.bool(false, "Entry-CHoCH markers", group = grpVF)
+showOF     = input.bool(false, "HTF bias background tint", group = grpVF)
+showDaily  = input.bool(false, "Daily Open + PDH + PDL", group = grpVF)
+showCPR    = input.bool(false, "Daily CPR (P / BC / TC)", group = grpVF)
+
+// ─────────────────── PRESET → EFFECTIVE PARAMETERS ───────────────────
+liqLen      = isManual ? iLiqLen      : isMore ? 3  : isAcc ? 4  : 5
+poiWindow   = isManual ? iPoiWindow   : isMore ? 60 : isAcc ? 45 : 30
+sweepWindow = isManual ? iSweepWindow : isMore ? 25 : isAcc ? 20 : 15
+useRRGate   = isManual ? iUseRRGate   : not isMore
+usePD       = isManual ? iUsePD       : isStrict
+useSeq      = isManual ? iUseSeq      : true
+useObImb    = isManual ? iUseObImb    : not isMore
+useFVGConf  = isManual ? iUseFVGConf  : isStrict
+strictCH    = isManual ? iStrictCH    : not isMore
+useDisp     = isManual ? iUseDisp     : not isMore
+useHtfTrend = isManual ? iUseHtfTrend : not isMore
+maxPerDay   = isManual ? iMaxPerDay   : isMore ? 5 : isAcc ? 3 : 2
+minScore    = isManual ? iMinScore    : isMore ? 1 : isAcc ? 2 : 3
+
+tfSec    = timeframe.in_seconds()
+maxHold  = iMaxHold > 0 ? iMaxHold : tfSec <= 60 ? 120 : tfSec <= 180 ? 80 : tfSec <= 300 ? 60 : tfSec <= 900 ? 32 : 24
+
+// ─────────────────────── HTF RESOLUTION ───────────────────────
+// 1m & 3m → 15m | 5m → 60m | 15m & 30m → 240m | 1h → 240m | 4h → D
+autoHTF() =>
+    p = timeframe.period
+    p == "1" ? "15" : p == "3" ? "15" : p == "5" ? "60" : p == "15" ? "240" : p == "30" ? "240" :
+     p == "60" ? "240" : p == "240" ? "D" : "60"
+htfTF = htfMode == "Auto" ? autoHTF() : htfMode
+
+// ─────────────────────── HTF STRUCTURE ENGINE ───────────────────────
+// Returns values of the LAST CONFIRMED HTF bar ([1] + lookahead_on).
+// This is the standard non-repainting pattern: history and live match.
+f_htf() =>
+    ph = ta.pivothigh(high, 2, 2)
+    pl = ta.pivotlow(low, 2, 2)
+    var float swHigh = na
+    var float swLow  = na
+    if not na(ph)
+        swHigh := ph
+    if not na(pl)
+        swLow := pl
+    var float lastBearHi = na
+    var float lastBearLo = na
+    var float lastBullHi = na
+    var float lastBullLo = na
+    if close < open
+        lastBearHi := high
+        lastBearLo := low
+    if close > open
+        lastBullHi := high
+        lastBullLo := low
+    fvgUp = low > high[2]
+    fvgDn = high < low[2]
+    bsFvgUp = ta.barssince(fvgUp)
+    bsFvgDn = ta.barssince(fvgDn)
+    emaH  = ta.ema(close, 50)
+    trend = close > emaH ? 1 : close < emaH ? -1 : 0
+    var int   bias  = 0
+    var float obLo  = na
+    var float obHi  = na
+    var int   obDir = 0
+    var int   obId  = 0
+    var bool  obImb = false
+    bosUp = not na(swHigh) and close > swHigh and (na(close[1]) or close[1] <= swHigh)
+    bosDn = not na(swLow)  and close < swLow  and (na(close[1]) or close[1] >= swLow)
+    if bosUp
+        bias  := 1
+        obHi  := lastBearHi
+        obLo  := lastBearLo
+        obDir := 1
+        obId  += 1
+        obImb := fvgUp or (not na(bsFvgUp) and bsFvgUp <= 3)
+    if bosDn
+        bias  := -1
+        obHi  := lastBullHi
+        obLo  := lastBullLo
+        obDir := -1
+        obId  += 1
+        obImb := fvgDn or (not na(bsFvgDn) and bsFvgDn <= 3)
+    eq = not na(swHigh) and not na(swLow) ? (swHigh + swLow) / 2 : na
+    [bias[1], obLo[1], obHi[1], obDir[1], obId[1], swHigh[1], swLow[1], eq[1], obImb[1], trend[1]]
+
+[htfBiasR, htfObLo, htfObHi, htfObDirR, htfObIdR, htfHigh, htfLow, htfEq, htfObImb, htfTrendR] =
+     request.security(syminfo.tickerid, htfTF, f_htf(), lookahead = barmerge.lookahead_on)
+htfBias  = nz(htfBiasR)
+htfObDir = nz(htfObDirR)
+htfObId  = nz(htfObIdR)
+htfTrend = nz(htfTrendR)
+
+// ─────────────────────── DAILY DATA ───────────────────────
+[dH, dL, dC, dOp] = request.security(syminfo.tickerid, "D",
+     [high[1], low[1], close[1], open], lookahead = barmerge.lookahead_on)
+cprP  = (dH + dL + dC) / 3.0
+cprBC = (dH + dL) / 2.0
+cprTC = 2.0 * cprP - cprBC
+exNewDay = ta.change(time("D")) != 0
+
+// ─────────────────────── INDICATOR FILTERS ───────────────────────
+rsiV   = ta.rsi(close, rsiLen)
+ema50  = ta.ema(close, 50)
+ema200 = ta.ema(close, 200)
+relVol = volume / math.max(ta.sma(volume, 20), 1e-10)
+atr14  = ta.atr(14)
+
+scoreLong  = (useRSI and rsiV > 50 ? 1 : 0) + (useEMA and close > ema50 ? 1 : 0) +
+             (useVol and relVol >= volMult ? 1 : 0) + (useCPR and close > cprP ? 1 : 0)
+scoreShort = (useRSI and rsiV < 50 ? 1 : 0) + (useEMA and close < ema50 ? 1 : 0) +
+             (useVol and relVol >= volMult ? 1 : 0) + (useCPR and close < cprP ? 1 : 0)
+activeFilters = (useRSI ? 1 : 0) + (useEMA ? 1 : 0) + (useVol ? 1 : 0) + (useCPR ? 1 : 0)
+needScore     = math.min(minScore, activeFilters)
+
+bullFVG = low > high[2]
+bearFVG = high < low[2]
+// barssince computed once per bar (v6 'and' is lazy — never put ta.* on its right side)
+bsBullFVG = ta.barssince(bullFVG)
+bsBearFVG = ta.barssince(bearFVG)
+bullFvgRecent = not na(bsBullFVG) and bsBullFVG <= 15
+bearFvgRecent = not na(bsBearFVG) and bsBearFVG <= 15
+
+inSess = not na(time(timeframe.period, sessIn, tzIn))
+sessOK = not useSess or inSess
+
+dayKey = dayofmonth(time, tzIn)
+newTzDay = dayKey != dayKey[1]
+var int tradesToday = 0
+if newTzDay
+    tradesToday := 0
+
+// ─────────────────────── LTF MICRO STRUCTURE ───────────────────────
+microPH = ta.pivothigh(high, 1, 1)
+microPL = ta.pivotlow(low, 1, 1)
+var float lastMicroHigh = na
+var float lastMicroLow  = na
+if not na(microPH)
+    lastMicroHigh := microPH
+if not na(microPL)
+    lastMicroLow := microPL
+
+liqPH = ta.pivothigh(high, liqLen, liqLen)
+liqPL = ta.pivotlow(low, liqLen, liqLen)
+var float lastLiqHigh    = na
+var float lastLiqLow     = na
+var int   lastLiqHighBar = na
+var int   lastLiqLowBar  = na
+if not na(liqPH)
+    if showStruct
+        isHH = na(lastLiqHigh) or liqPH > lastLiqHigh
+        label.new(bar_index - liqLen, liqPH, isHH ? "HH" : "LH",
+             style = label.style_label_down, color = color.new(color.gray, 100),
+             textcolor = isHH ? color.green : color.red, size = size.tiny)
+    lastLiqHigh    := liqPH
+    lastLiqHighBar := bar_index - liqLen
+if not na(liqPL)
+    if showStruct
+        isHL = not na(lastLiqLow) and liqPL > lastLiqLow
+        label.new(bar_index - liqLen, liqPL, isHL ? "HL" : "LL",
+             style = label.style_label_up, color = color.new(color.gray, 100),
+             textcolor = isHL ? color.green : color.red, size = size.tiny)
+    lastLiqLow    := liqPL
+    lastLiqLowBar := bar_index - liqLen
+
+var int ltfTrend = 0
+brokeH = not na(lastLiqHigh) and close > lastLiqHigh and close[1] <= lastLiqHigh
+brokeL = not na(lastLiqLow)  and close < lastLiqLow  and close[1] >= lastLiqLow
+if brokeH
+    if showBOS and not na(lastLiqHighBar)
+        line.new(lastLiqHighBar, lastLiqHigh, bar_index, lastLiqHigh,
+             color = color.new(color.green, 30), style = line.style_solid, width = 1)
+        label.new(bar_index, lastLiqHigh, ltfTrend < 0 ? "CHoCH" : "BOS",
+             style = label.style_label_down, color = color.new(color.gray, 100),
+             textcolor = color.green, size = size.tiny)
+    ltfTrend := 1
+if brokeL
+    if showBOS and not na(lastLiqLowBar)
+        line.new(lastLiqLowBar, lastLiqLow, bar_index, lastLiqLow,
+             color = color.new(color.red, 30), style = line.style_solid, width = 1)
+        label.new(bar_index, lastLiqLow, ltfTrend > 0 ? "CHoCH" : "BOS",
+             style = label.style_label_up, color = color.new(color.gray, 100),
+             textcolor = color.red, size = size.tiny)
+    ltfTrend := -1
+
+// ─────────────────────── POI TAP TRACKING ───────────────────────
+inLongPOI  = htfObDir == 1  and not na(htfObLo) and low  <= htfObHi and high >= htfObLo
+inShortPOI = htfObDir == -1 and not na(htfObHi) and high >= htfObLo and low  <= htfObHi
+bsLongPOI  = ta.barssince(inLongPOI)
+bsShortPOI = ta.barssince(inShortPOI)
+
+var int curObId      = -1
+var int poiFirstTapL = na
+var int poiFirstTapS = na
+if htfObId != curObId
+    curObId      := htfObId
+    poiFirstTapL := na
+    poiFirstTapS := na
+if inLongPOI and na(poiFirstTapL)
+    poiFirstTapL := bar_index
+if inShortPOI and na(poiFirstTapS)
+    poiFirstTapS := bar_index
+
+// POI must be tapped for the CURRENT OB, and recently
+longPOIRecent  = htfObDir == 1  and not na(poiFirstTapL) and not na(bsLongPOI)  and bsLongPOI  <= poiWindow
+shortPOIRecent = htfObDir == -1 and not na(poiFirstTapS) and not na(bsShortPOI) and bsShortPOI <= poiWindow
+
+// ─────────────────── LIQUIDITY SWEEP + ENTRY CHoCH ───────────────────
+var bool  swpLong      = false
+var int   swpLongBar   = na
+var float swpLongExt   = na
+var float chochLvlLong = na
+sweepLowEvt = not na(lastLiqLow) and low < lastLiqLow and close > lastLiqLow
+if sweepLowEvt
+    swpLong      := true
+    swpLongBar   := bar_index
+    swpLongExt   := low
+    chochLvlLong := lastMicroHigh
+if swpLong and low < swpLongExt
+    swpLongExt := low      // sweep extended deeper → SL follows the true extreme
+if swpLong and bar_index - swpLongBar > sweepWindow
+    swpLong := false
+
+var bool  swpShort      = false
+var int   swpShortBar   = na
+var float swpShortExt   = na
+var float chochLvlShort = na
+sweepHighEvt = not na(lastLiqHigh) and high > lastLiqHigh and close < lastLiqHigh
+if sweepHighEvt
+    swpShort      := true
+    swpShortBar   := bar_index
+    swpShortExt   := high
+    chochLvlShort := lastMicroLow
+if swpShort and high > swpShortExt
+    swpShortExt := high
+if swpShort and bar_index - swpShortBar > sweepWindow
+    swpShort := false
+
+bodySz = math.abs(close - open)
+dispUp = not useDisp or (close > open and bodySz >= dispMult * atr14)
+dispDn = not useDisp or (close < open and bodySz >= dispMult * atr14)
+
+chochUp = swpLong  and not na(chochLvlLong)  and (strictCH ? close > chochLvlLong  : high > chochLvlLong)  and dispUp
+chochDn = swpShort and not na(chochLvlShort) and (strictCH ? close < chochLvlShort : low  < chochLvlShort) and dispDn
+
+if showSweep and sweepLowEvt
+    label.new(bar_index, low, "SWEEP", style = label.style_label_up,
+         color = color.new(color.orange, 15), textcolor = color.black, size = size.tiny)
+if showSweep and sweepHighEvt
+    label.new(bar_index, high, "SWEEP", style = label.style_label_down,
+         color = color.new(color.orange, 15), textcolor = color.black, size = size.tiny)
+chochUpNew = chochUp and not chochUp[1]
+chochDnNew = chochDn and not chochDn[1]
+if showCHmk and chochUpNew
+    label.new(bar_index, high, "CHoCH ↑", style = label.style_label_down,
+         color = color.new(color.gray, 100), textcolor = color.lime, size = size.tiny)
+if showCHmk and chochDnNew
+    label.new(bar_index, low, "CHoCH ↓", style = label.style_label_up,
+         color = color.new(color.gray, 100), textcolor = color.red, size = size.tiny)
+
+// ─────────────────────── TRADE STATE ───────────────────────
+var int    tDir     = 0
+var int    lastDir  = 0
+var float  tEntry   = na
+var float  tSL      = na
+var float  tTP      = na
+var float  tRisk    = na
+var int    tBar     = na
+var bool   beDone   = false
+var int    usedObId = -1
+var string tStatus  = "—"
+var string tSigTime = "—"
+
+var int   nTrades = 0
+var int   nWins   = 0
+var int   nLoss   = 0
+var int   nBE     = 0
+var int   cTP     = 0
+var int   cSL     = 0
+var int   cTime   = 0
+var float netR    = 0.0
+
+var line lSl = na
+var line lTp = na
+var tradeLines = array.new<line>()
+var sigLabels  = array.new<label>()
+
+colSL = color.new(color.red, 0)
+colTP = color.new(color.blue, 0)
+
+fmt(float v) =>
+    na(v) ? "—" : str.tostring(v, format.mintick)
+
+slBuffer = math.max(0.10 * atr14, spreadTicks * syminfo.mintick)
+
+// ─────────────────── TRADE MANAGEMENT (runs before new entries) ───────────────────
+// Evaluated from the bar AFTER entry. If SL and TP are both touched in the
+// same candle, SL is assumed (conservative, like a real broker fill).
+float  exitR   = na
+string exitTxt = ""
+if tDir != 0 and bar_index > tBar
+    if tDir == 1
+        if low <= tSL
+            exitR   := (tSL - tEntry) / tRisk
+            exitTxt := beDone ? "BE" : "SL"
+        else if high >= tTP
+            exitR   := tpRR
+            exitTxt := "TP"
+    else
+        if high >= tSL
+            exitR   := (tEntry - tSL) / tRisk
+            exitTxt := beDone ? "BE" : "SL"
+        else if low <= tTP
+            exitR   := tpRR
+            exitTxt := "TP"
+    if na(exitR) and bar_index - tBar >= maxHold
+        exitR   := tDir == 1 ? (close - tEntry) / tRisk : (tEntry - close) / tRisk
+        exitTxt := "TIME"
+    if na(exitR) and useBE and not beDone and beAt < tpRR
+        beHit = tDir == 1 ? high >= tEntry + beAt * tRisk : low <= tEntry - beAt * tRisk
+        if beHit
+            beDone := true
+            tSL    := tEntry
+            line.set_x2(lSl, bar_index)
+            lSl := line.new(bar_index, tSL, bar_index, tSL, color = colSL, width = 2, style = line.style_dotted)
+            array.push(tradeLines, lSl)
+            tStatus := "RUNNING (SL at BE)"
+
+if not na(exitR)
+    line.set_x2(lSl, bar_index)
+    line.set_x2(lTp, bar_index)
+    netR += exitR
+    if exitR > 0
+        nWins += 1
+    else if exitR < 0
+        nLoss += 1
+    else
+        nBE += 1
+    if exitTxt == "TP"
+        cTP += 1
+    if exitTxt == "SL"
+        cSL += 1
+    if exitTxt == "TIME"
+        cTime += 1
+    tStatus := exitTxt == "TP" ? "TP HIT ✓" : exitTxt == "SL" ? "SL HIT ✗" : exitTxt == "BE" ? "BREAK-EVEN" :
+         "TIME EXIT (" + str.tostring(exitR, "#.##") + "R)"
+    if alertsOn and alertExits
+        alert("APEX SMC " + syminfo.ticker + " (" + timeframe.period + ") " + (tDir == 1 ? "BUY" : "SELL") +
+             " closed: " + tStatus, alert.freq_once_per_bar_close)
+    tDir := 0
+else if tDir != 0
+    line.set_x2(lSl, bar_index)
+    line.set_x2(lTp, bar_index)
+
+// ─────────────────────── ENTRY CONDITIONS ───────────────────────
+pdLongOK  = not usePD or na(htfEq) or close < htfEq
+pdShortOK = not usePD or na(htfEq) or close > htfEq
+
+seqLongOK  = not useSeq or (not na(poiFirstTapL) and not na(swpLongBar)  and swpLongBar  >= poiFirstTapL - 3)
+seqShortOK = not useSeq or (not na(poiFirstTapS) and not na(swpShortBar) and swpShortBar >= poiFirstTapS - 3)
+
+imbOK      = not useObImb or htfObImb
+fvgLongOK  = not useFVGConf or bullFvgRecent
+fvgShortOK = not useFVGConf or bearFvgRecent
+trendLOK   = not useHtfTrend or htfTrend == 1
+trendSOK   = not useHtfTrend or htfTrend == -1
+dayCapOK   = tradesToday < maxPerDay
+
+longCore  = htfBias == 1  and longPOIRecent  and chochUp and tDir == 0 and htfObId != usedObId
+shortCore = htfBias == -1 and shortPOIRecent and chochDn and tDir == 0 and htfObId != usedObId
+
+goLongRaw  = longCore  and pdLongOK  and seqLongOK  and imbOK and fvgLongOK  and trendLOK and sessOK and dayCapOK and scoreLong  >= needScore and barstate.isconfirmed
+goShortRaw = shortCore and pdShortOK and seqShortOK and imbOK and fvgShortOK and trendSOK and sessOK and dayCapOK and scoreShort >= needScore and barstate.isconfirmed
+
+// Risk model: SL beyond the sweep extreme (+buffer), clamped to [min, max] × ATR
+longSL  = math.min(nz(swpLongExt, low) - slBuffer, close - minRiskATR * atr14)
+shortSL = math.max(nz(swpShortExt, high) + slBuffer, close + minRiskATR * atr14)
+longRk  = close - longSL
+shortRk = shortSL - close
+longRiskOK  = longRk  > 0 and longRk  <= maxRiskATR * atr14
+shortRiskOK = shortRk > 0 and shortRk <= maxRiskATR * atr14
+// Room gate: opposite HTF liquidity must lie beyond TP (price above old swing = open sky)
+longRoomOK  = not useRRGate or na(htfHigh) or htfHigh <= close or (htfHigh - close) >= tpRR * longRk
+shortRoomOK = not useRRGate or na(htfLow)  or htfLow  >= close or (close - htfLow)  >= tpRR * shortRk
+
+goLong  = goLongRaw  and longRiskOK  and longRoomOK
+goShort = goShortRaw and shortRiskOK and shortRoomOK and not goLong
+
+f_newTrade(int dir, float sl) =>
+    rk = math.abs(close - sl)
+    tp = dir == 1 ? close + tpRR * rk : close - tpRR * rk
+    [rk, tp]
+
+if goLong or goShort
+    dir = goLong ? 1 : -1
+    sl  = goLong ? longSL : shortSL
+    [rk, tp] = f_newTrade(dir, sl)
+    tDir     := dir
+    lastDir  := dir
+    tEntry   := close
+    tSL      := sl
+    tTP      := tp
+    tRisk    := rk
+    tBar     := bar_index
+    beDone   := false
+    usedObId := htfObId
+    nTrades     += 1
+    tradesToday += 1
+    tStatus  := "RUNNING"
+    tSigTime := str.format_time(time, "dd MMM HH:mm", tzIn)
+    if dir == 1
+        swpLong := false
+    else
+        swpShort := false
+    // Only two lines: SL (red) + TP (blue). They stop at the touching candle.
+    lSl := line.new(bar_index, tSL, bar_index, tSL, color = colSL, width = 2)
+    lTp := line.new(bar_index, tTP, bar_index, tTP, color = colTP, width = 2)
+    array.push(tradeLines, lSl)
+    array.push(tradeLines, lTp)
+    tip = (dir == 1 ? "BUY" : "SELL") + " " + tSigTime + "\nEntry: " + fmt(tEntry) + "\nSL: " + fmt(tSL) + "\nTP: " + fmt(tTP)
+    lb = dir == 1 ?
+         label.new(bar_index, low, "BUY", yloc = yloc.belowbar, style = label.style_label_up,
+             color = color.new(color.green, 10), textcolor = color.white, size = size.small, tooltip = tip) :
+         label.new(bar_index, high, "SELL", yloc = yloc.abovebar, style = label.style_label_down,
+             color = color.new(color.red, 10), textcolor = color.white, size = size.small, tooltip = tip)
+    array.push(sigLabels, lb)
+    if alertsOn
+        alert("APEX SMC " + (dir == 1 ? "BUY" : "SELL") + " " + syminfo.ticker + " (" + timeframe.period + ")" +
+             "\nEntry: " + fmt(tEntry) + "\nSL: " + fmt(tSL) + "\nTP: " + fmt(tTP) +
+             " (" + str.tostring(tpRR) + "R)", alert.freq_once_per_bar_close)
+
+// Keep chart clean: only the last N trades' drawings
+while array.size(sigLabels) > keepTrades
+    label.delete(array.shift(sigLabels))
+while array.size(tradeLines) > keepTrades * 3
+    line.delete(array.shift(tradeLines))
+
+// ═══════════════════ VERIFY DRAWINGS (optional, default OFF) ═══════════════════
+
+var bullFvgA = array.new<box>()
+var bearFvgA = array.new<box>()
+if showFVG and bullFVG
+    array.push(bullFvgA, box.new(bar_index - 2, low, bar_index, high[2],
+         bgcolor = color.new(color.teal, 85), border_color = color.new(color.teal, 55),
+         text = "FVG", text_color = color.new(color.teal, 40), text_size = size.tiny))
+if showFVG and bearFVG
+    array.push(bearFvgA, box.new(bar_index - 2, low[2], bar_index, high,
+         bgcolor = color.new(color.maroon, 85), border_color = color.new(color.red, 55),
+         text = "FVG", text_color = color.new(color.red, 40), text_size = size.tiny))
+if array.size(bullFvgA) > 0
+    for i = array.size(bullFvgA) - 1 to 0
+        b = array.get(bullFvgA, i)
+        if low <= box.get_bottom(b)
+            box.delete(b)
+            array.remove(bullFvgA, i)
+        else
+            box.set_right(b, bar_index)
+if array.size(bearFvgA) > 0
+    for i = array.size(bearFvgA) - 1 to 0
+        b = array.get(bearFvgA, i)
+        if high >= box.get_top(b)
+            box.delete(b)
+            array.remove(bearFvgA, i)
+        else
+            box.set_right(b, bar_index)
+while array.size(bullFvgA) > 25
+    box.delete(array.shift(bullFvgA))
+while array.size(bearFvgA) > 25
+    box.delete(array.shift(bearFvgA))
+
+var line  idmLn = na
+var label idmLb = na
+idmPrice = htfBias == 1 ? lastMicroLow : htfBias == -1 ? lastMicroHigh : na
+if showIDM and not na(idmPrice)
+    if na(idmLn)
+        idmLn := line.new(bar_index - 1, idmPrice, bar_index, idmPrice,
+             color = color.new(color.silver, 20), style = line.style_dotted, width = 1)
+        idmLb := label.new(bar_index, idmPrice, "IDM",
+             style = label.style_label_left, color = color.new(color.gray, 100),
+             textcolor = color.silver, size = size.tiny)
+    line.set_xy1(idmLn, bar_index - 25, idmPrice)
+    line.set_xy2(idmLn, bar_index, idmPrice)
+    label.set_x(idmLb, bar_index + 1)
+    label.set_y(idmLb, idmPrice)
+
+var line  erlLn = na
+var label erlLb = na
+erlPrice = htfBias == 1 ? lastLiqLow : htfBias == -1 ? lastLiqHigh : na
+if showERL and not na(erlPrice)
+    if na(erlLn)
+        erlLn := line.new(bar_index - 1, erlPrice, bar_index, erlPrice,
+             color = color.new(color.purple, 10), style = line.style_dashed, width = 1)
+        erlLb := label.new(bar_index, erlPrice, "ERL",
+             style = label.style_label_left, color = color.new(color.gray, 100),
+             textcolor = color.purple, size = size.tiny)
+    line.set_xy1(erlLn, bar_index - 25, erlPrice)
+    line.set_xy2(erlLn, bar_index, erlPrice)
+    label.set_x(erlLb, bar_index + 1)
+    label.set_y(erlLb, erlPrice)
+
+var line  bslLn = na
+var label bslLb = na
+var line  sslLn = na
+var label sslLb = na
+if showLiq and not na(lastLiqHigh)
+    if na(bslLn)
+        bslLn := line.new(bar_index - 1, lastLiqHigh, bar_index, lastLiqHigh,
+             color = color.new(color.red, 35), style = line.style_dotted, width = 1)
+        bslLb := label.new(bar_index, lastLiqHigh, "BSL $$$",
+             style = label.style_label_left, color = color.new(color.gray, 100),
+             textcolor = color.new(color.red, 20), size = size.tiny)
+    line.set_xy1(bslLn, nz(lastLiqHighBar, bar_index - 25), lastLiqHigh)
+    line.set_xy2(bslLn, bar_index, lastLiqHigh)
+    label.set_x(bslLb, bar_index + 1)
+    label.set_y(bslLb, lastLiqHigh)
+if showLiq and not na(lastLiqLow)
+    if na(sslLn)
+        sslLn := line.new(bar_index - 1, lastLiqLow, bar_index, lastLiqLow,
+             color = color.new(color.green, 35), style = line.style_dotted, width = 1)
+        sslLb := label.new(bar_index, lastLiqLow, "SSL $$$",
+             style = label.style_label_left, color = color.new(color.gray, 100),
+             textcolor = color.new(color.green, 20), size = size.tiny)
+    line.set_xy1(sslLn, nz(lastLiqLowBar, bar_index - 25), lastLiqLow)
+    line.set_xy2(sslLn, bar_index, lastLiqLow)
+    label.set_x(sslLb, bar_index + 1)
+    label.set_y(sslLb, lastLiqLow)
+
+bgcolor(showOF and htfBias == 1 ? color.new(color.green, 95) :
+     showOF and htfBias == -1 ? color.new(color.red, 95) : na, title = "Order-flow bias")
+
+var line opLn  = na
+var line pdhLn = na
+var line pdlLn = na
+var label opLb  = na
+var label pdhLb = na
+var label pdlLb = na
+if showDaily and exNewDay and not na(dOp)
+    opLn  := line.new(bar_index, dOp, bar_index + 1, dOp, color = color.new(color.blue, 25), width = 1)
+    pdhLn := line.new(bar_index, dH, bar_index + 1, dH, color = color.new(color.red, 40), style = line.style_dashed)
+    pdlLn := line.new(bar_index, dL, bar_index + 1, dL, color = color.new(color.green, 40), style = line.style_dashed)
+    label.delete(opLb)
+    label.delete(pdhLb)
+    label.delete(pdlLb)
+    opLb  := label.new(bar_index, dOp, "dOpen", style = label.style_label_left, color = color.new(color.gray, 100), textcolor = color.blue, size = size.tiny)
+    pdhLb := label.new(bar_index, dH, "PDH", style = label.style_label_left, color = color.new(color.gray, 100), textcolor = color.red, size = size.tiny)
+    pdlLb := label.new(bar_index, dL, "PDL", style = label.style_label_left, color = color.new(color.gray, 100), textcolor = color.green, size = size.tiny)
+if showDaily and not na(opLn)
+    line.set_x2(opLn, bar_index)
+    line.set_x2(pdhLn, bar_index)
+    line.set_x2(pdlLn, bar_index)
+    label.set_x(opLb, bar_index + 1)
+    label.set_x(pdhLb, bar_index + 1)
+    label.set_x(pdlLb, bar_index + 1)
+
+var line cprPLn  = na
+var line cprTCLn = na
+var line cprBCLn = na
+var label cprLb  = na
+if showCPR and exNewDay and not na(cprP)
+    cprPLn  := line.new(bar_index, cprP, bar_index + 1, cprP, color = color.new(color.orange, 10), width = 2)
+    cprTCLn := line.new(bar_index, cprTC, bar_index + 1, cprTC, color = color.new(color.orange, 55), width = 1)
+    cprBCLn := line.new(bar_index, cprBC, bar_index + 1, cprBC, color = color.new(color.orange, 55), width = 1)
+    label.delete(cprLb)
+    cprLb := label.new(bar_index, cprP, "CPR", style = label.style_label_left,
+         color = color.new(color.gray, 100), textcolor = color.orange, size = size.tiny)
+if showCPR and not na(cprPLn)
+    line.set_x2(cprPLn, bar_index)
+    line.set_x2(cprTCLn, bar_index)
+    line.set_x2(cprBCLn, bar_index)
+    label.set_x(cprLb, bar_index + 1)
+
+plot(showEMA ? ema50  : na, "EMA 50",  color = color.new(color.aqua, 30))
+plot(showEMA ? ema200 : na, "EMA 200", color = color.new(color.purple, 30))
+
+var box obBox = na
+var int drawnObId = -1
+if showOB and not na(htfObLo) and htfObId != drawnObId
+    if not na(obBox)
+        box.delete(obBox)
+    obBox := box.new(bar_index, htfObHi, bar_index + 1, htfObLo,
+         bgcolor = htfObDir == 1 ? color.new(color.green, 88) : color.new(color.red, 88),
+         border_color = htfObDir == 1 ? color.new(color.green, 45) : color.new(color.red, 45),
+         text = htfObDir == 1 ? "HTF OB ▲" : "HTF OB ▼",
+         text_color = htfObDir == 1 ? color.new(color.green, 30) : color.new(color.red, 30),
+         text_size = size.tiny)
+    drawnObId := htfObId
+if showOB and not na(obBox)
+    box.set_right(obBox, bar_index + 1)
+
+// ─────────────────────────── TABLES ───────────────────────────
+colBg  = color.rgb(18, 20, 26)
+colHdr = color.rgb(35, 38, 48)
+
+var table tt = table.new(position.top_right, 2, 7, bgcolor = colBg,
+     frame_width = 1, frame_color = color.new(color.gray, 40),
+     border_width = 1, border_color = color.new(color.gray, 70))
+if showTrade and barstate.islast
+    hdrBg  = tDir == 1 ? color.rgb(0, 110, 50) : tDir == -1 ? color.rgb(150, 25, 25) : colHdr
+    hdrTxt = tDir == 1 ? "BUY ●" : tDir == -1 ? "SELL ●" :
+         lastDir == 1 ? "LAST BUY" : lastDir == -1 ? "LAST SELL" : "WAIT"
+    hasData = nTrades > 0
+    valCol  = tDir != 0 ? color.white : color.new(color.white, 40)
+    table.cell(tt, 0, 0, "APEX SMC", text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+    table.cell(tt, 1, 0, hdrTxt, text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+    table.cell(tt, 0, 1, "Today", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 1, str.tostring(tradesToday) + " / " + str.tostring(maxPerDay), text_color = color.aqua, text_size = size.small)
+    table.cell(tt, 0, 2, "Time", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 2, hasData ? tSigTime : "—", text_color = valCol, text_size = size.small)
+    table.cell(tt, 0, 3, "Entry", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 3, hasData ? fmt(tEntry) : "—", text_color = valCol, text_size = size.small)
+    table.cell(tt, 0, 4, "SL", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 4, hasData ? fmt(tSL) : "—", text_color = color.rgb(255, 90, 90), text_size = size.small)
+    table.cell(tt, 0, 5, "TP (" + str.tostring(tpRR) + "R)", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 5, hasData ? fmt(tTP) : "—", text_color = color.rgb(90, 150, 255), text_size = size.small)
+    table.cell(tt, 0, 6, "Status", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 6, hasData ? tStatus : "—", text_color = color.yellow, text_size = size.small)
+
+var table st = table.new(position.bottom_right, 2, 8, bgcolor = colBg,
+     frame_width = 1, frame_color = color.new(color.gray, 40),
+     border_width = 1, border_color = color.new(color.gray, 70))
+if showStats and barstate.islast
+    closed = nWins + nLoss + nBE
+    wr = nWins + nLoss > 0 ? 100.0 * nWins / (nWins + nLoss) : 0.0
+    presetTxt = isAcc ? "Accurate" : isMore ? "More signals" : isStrict ? "Strict" : "Manual"
+    table.cell(st, 0, 0, "BACKTEST (approx)", text_color = color.white, bgcolor = color.rgb(25, 60, 130), text_size = size.tiny)
+    table.cell(st, 1, 0, htfTF + " / " + timeframe.period, text_color = color.white, bgcolor = color.rgb(25, 60, 130), text_size = size.tiny)
+    table.cell(st, 0, 1, "Preset", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 1, presetTxt, text_color = color.aqua, text_size = size.tiny)
+    table.cell(st, 0, 2, "Signals", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 2, str.tostring(nTrades), text_color = color.white, text_size = size.tiny)
+    table.cell(st, 0, 3, "W / L / BE", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 3, str.tostring(nWins) + " / " + str.tostring(nLoss) + " / " + str.tostring(nBE), text_color = color.white, text_size = size.tiny)
+    table.cell(st, 0, 4, "Win %", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 4, str.tostring(wr, "#.#") + "%", text_color = wr >= 50 ? color.rgb(70, 220, 90) : color.orange, text_size = size.tiny)
+    table.cell(st, 0, 5, "TP / SL / Time", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 5, str.tostring(cTP) + " / " + str.tostring(cSL) + " / " + str.tostring(cTime), text_color = color.white, text_size = size.tiny)
+    table.cell(st, 0, 6, "Net R", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 6, str.tostring(netR, "#.##") + " R", text_color = netR >= 0 ? color.rgb(70, 220, 90) : color.rgb(255, 90, 90), text_size = size.tiny)
+    table.cell(st, 0, 7, "Avg R / trade", text_color = color.silver, text_size = size.tiny)
+    table.cell(st, 1, 7, closed > 0 ? str.tostring(netR / closed, "#.##") + " R" : "—", text_color = color.white, text_size = size.tiny)
+
+// Fallback per-signal alert conditions (prefer "Any alert() function call" — it includes Entry/SL/TP)
+alertcondition(goLong,  "APEX SMC BUY",  "APEX SMC BUY {{ticker}} ({{interval}}) @ {{close}}")
+alertcondition(goShort, "APEX SMC SELL", "APEX SMC SELL {{ticker}} ({{interval}}) @ {{close}}")

@@ -15,8 +15,8 @@
 // ║   • alert() on BUY / SELL / TP / SL → sound + pop-up in TV        ║
 // ║   • CPR / OB box drawings OFF by default (no chart noise)         ║
 // ║   • 1h added: 1m/3m→15m | 5m→60m | 15m→240m | 1h→240m             ║
-// ║   • Pinned to the price scale → drawings stay on the candles      ║
-// ║     when you zoom / scroll                                        ║
+// ║   • Pinned to the price scale + invisible high/low scale anchor   ║
+// ║     → labels / SL / TP stay on the candles when zooming/scrolling ║
 // ╠══════════════════════════════════════════════════════════════════╣
 // ║  COPY THE WHOLE FILE. The last line must be:                      ║
 // ║  // ═══ END OF APEX SMC v4.1 ═══                                   ║
@@ -541,6 +541,13 @@ if goLong or goShort
 plot(tDir != 0 ? tEntry : na, "Entry", color = color.gray, display = display.data_window)
 plot(tDir != 0 ? tSL    : na, "SL",    color = colSL,      display = display.data_window)
 plot(tDir != 0 ? tTP    : na, "TP",    color = colTP,      display = display.data_window)
+
+// Scale anchor: invisible plots of each candle's high / low. If TradingView ever puts
+// this indicator on its own price scale, that scale still auto-fits exactly the same
+// range as the candles, so BUY/SELL labels and SL/TP lines stay on the candles when
+// zooming or scrolling. (Invisible: 100% transparent, not in status line / price scale.)
+plot(high, "Scale anchor high", color = color.new(color.white, 100), editable = false, display = display.pane)
+plot(low,  "Scale anchor low",  color = color.new(color.white, 100), editable = false, display = display.pane)
 
 // Keep chart clean: only the last N trades' drawings
 while array.size(sigLabels) > keepTrades

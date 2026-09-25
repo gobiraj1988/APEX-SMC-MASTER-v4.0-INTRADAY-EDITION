@@ -21,6 +21,9 @@ The alert message contains symbol, TF, Entry, SL and TP. Exit alerts (TP / SL / 
 - HTF pairing: 1m/3m→15m, 5m→60m, 15m→240m, 1h→240m.
 
 ## Drawings not sitting on the candles?
-The script pins itself to the price scale (`scale = scale.right`). If an older copy was added before this fix,
-remove it from the chart and add it again, or: indicator name → ⋯ → **Pin to scale → Pin to right scale**.
-Also remove the old v4.0 indicator from the chart.
+The script pins itself to the price scale (`scale = scale.right`) and plots invisible high/low
+"scale anchors", so even on its own scale it fits the same range as the candles.
+TradingView keeps the scale of an instance that is already on the chart, so after updating:
+1. Remove **every** APEX SMC instance from the chart (including the old v4.0).
+2. Add it again from Indicators → My scripts.
+3. If labels are still off: indicator name → ⋯ → **Pin to scale → Pin to right scale**.
